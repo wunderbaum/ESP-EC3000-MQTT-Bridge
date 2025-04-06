@@ -442,12 +442,13 @@ void loop() {
       reason += "Power too high; ";
     }
 
-    uint16_t lastResets;
-    double lastConsumption;
-    if (!updateResetTracker(frame.ID, frame.NumberOfResets, frame.Consumption, &lastResets, &lastConsumption)) {
-      valid = false;
-      reason += "Resets not +1 (last=" + String(lastResets) + "); ";
-    } 
+    // The Reset does more complex things than that for unknown reasons but it's not really worth it messing around with it because all bad packets are sorted out with the other checks already.
+    // uint16_t lastResets;
+    // double lastConsumption;
+    // if (!updateResetTracker(frame.ID, frame.NumberOfResets, frame.Consumption, &lastResets, &lastConsumption)) {
+    //   valid = false;
+    //   reason += "Resets not +1 (last=" + String(lastResets) + "); ";
+    // } 
     
     if (!updateResetTracker(frame.ID, frame.NumberOfResets, frame.Consumption, &lastResets, &lastConsumption)) {
       // Consumption check
