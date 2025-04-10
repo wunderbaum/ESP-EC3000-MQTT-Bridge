@@ -1,7 +1,8 @@
-made a platformio version out of it.
-wifi-credentials are now in an external file include/wifidata.h
-added a whitelist in
-include/whitelist.h
+Wunderbaums changes:
+- made a platformio version out of it.
+- wifi-credentials are now in an external file include/wifidata.h
+- added a whitelist in
+- include/whitelist.h
 
 
 
