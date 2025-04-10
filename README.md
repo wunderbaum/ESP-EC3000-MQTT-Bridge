@@ -1,3 +1,10 @@
+made a platformio version out of it.
+wifi-credentials are now in an external file include/wifidata.h
+added a whitelist in
+include/whitelist.h
+
+
+
 # ESP-EC3000-MQTT-Bridge
 Empfängt EC3000-Pakete und dekodiert sie über einen RFM69, der mit einem ESP8266/ESP32 verbunden ist, und sendet sie nach einigen Plausibilitätsprüfungen an MQTT.
 ---
