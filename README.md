@@ -43,3 +43,4 @@ Der RSSI Wert ist immer gleich...
 
 QUELLEN: (EC3000 Paketverarbeitung und dazugehörige RFM69 Initialisierung)
 https://github.com/Rainerlan/LaCrosseGatewayMQTT
+https://github.com/yustAnotherUser/ESP-EC3000-MQTT-Bridge
