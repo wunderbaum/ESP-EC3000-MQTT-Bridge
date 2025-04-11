@@ -231,12 +231,14 @@ void publishDiscoveryMessages(uint16_t id) {
 
   // Consumption sensor
   char consumption_topic[64];
-  snprintf(consumption_topic, sizeof(consumption_topic), "homeassistant/sensor/%s/consumption/config", device_id);
-  String consumption_payload = "{\"name\": \"Consumption\","
+  snprintf(consumption_topic, sizeof(consumption_topic), "homeassistant/sensor/%s/energy/config", device_id);
+  String consumption_payload = "{\"name\": \"Energy\","
                                "\"state_topic\": \"" + String(state_topic) + "\","
-                               "\"unique_id\": \"" + String(id, HEX) + "_consumption\","
+                               "\"unique_id\": \"" + String(id, HEX) + "_energy\","
                                "\"unit_of_measurement\": \"kWh\","
                                "\"value_template\": \"{{ value_json.Consumption }}\","
+                               "\"device_class\": \"energy\","
+                               "\"state_class\": \"total_increasing\","
                                "\"device\": " + device_info + "}";
   client.publish(consumption_topic, consumption_payload.c_str(), true);
 
