@@ -2,7 +2,7 @@ Wunderbaums changes:
 - made a platformio version out of it.
 - wifi-credentials are now in an external file include/wifidata.h
 - added a whitelist in include/whitelist.h
-- added home assistant auto discovery
+- made home assistant auto discovery working
 
 
 # ESP-EC3000-MQTT-Bridge
