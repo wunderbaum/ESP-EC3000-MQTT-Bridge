@@ -210,14 +210,23 @@ void publishDiscoveryMessages(uint16_t id) {
                        "\"model\": \"EC3000 Energy Monitor\"}";
   // Power sensor
   char power_topic[64];
+  
   snprintf(power_topic, sizeof(power_topic), "homeassistant/sensor/%s/config", device_id);
   String power_payload = "{\"name\": \"Power\","
                  "\"state_topic\": \"" + String(state_topic) + "\","
                  "\"unit_of_measurement\": \"W\","
-                 "\"value_template\": \"\\{\\{ value_json.Power \\}\\}\","
+                 "\"value_template\": \"{{ value_json.Power }}\","
                  "\"device_class\": \"power\","
                  "\"device\": " + device_info + "}";
-  client.publish(power_topic, power_payload.c_str(), true);
+ // String power_payload = "{\"name\": \"Test\", \"state_topic\": \"EC3000/Test\"}";
+  // client.publish(power_topic, power_payload.c_str(), true);
+  if (!client.publish(power_topic, power_payload.c_str(), true)) {
+    Serial.println("Fehler beim Senden der MQTT-Nachricht.");
+    Serial.println(power_topic);
+    Serial.println(power_payload);
+    Serial.print("Payload Länge: ");
+    Serial.println(power_payload.length());
+  }
 
   // Consumption sensor
   char consumption_topic[64];
@@ -291,8 +300,7 @@ void publishDiscoveryMessages(uint16_t id) {
 
   Serial.print("Published discovery messages for ID: 0x");
   Serial.println(id, HEX);
-  // Serial.println(power_topic);
-  // Serial.println(power_payload);
+ 
 }
 
 void reconnect() {
@@ -423,8 +431,20 @@ void setup() {
   }
   Serial.println("\nWiFi connected");
 
-  client.setBufferSize(1024);  // oder 512 – je nach Bedarf
+  client.setBufferSize(1024);  
   client.setServer(mqtt_server, mqtt_port);
+  if (!client.connected()) {
+    if (client.connect("ESP32Client")) {
+      Serial.println("Verbunden mit dem MQTT-Server!");
+    } else {
+      Serial.print("Verbindung fehlgeschlagen, rc=");
+      Serial.println(client.state());
+      delay(5000);
+    }
+  }
+  if (!client.publish("EC3000/debug", "EC3000 MQTT Bridge initialized successfully!")) {
+    Serial.println("Fehler beim Senden der DEBUG-Nachricht.");
+  }
 
   pinMode(RFM69_CS, OUTPUT);
   digitalWrite(RFM69_CS, HIGH);
@@ -486,7 +506,11 @@ void setup() {
   WriteReg(REG_OPMODE, (ReadReg(REG_OPMODE) & 0xE3) | 0x10);
 
   Serial.println("RFM69 initialized successfully!");
-  client.publish("EC3000/debug", "EC3000 MQTT Bridge initialized successfully!");
+
+  for (int i = 0; i < whitelistSize; i++) {
+    uint16_t id = strtol(whitelist[i], nullptr, 16);  // Umwandlung von Hex-String zu uint16_t
+    publishDiscoveryMessages(id);
+  }
 
   uint8_t reg07 = ReadReg(0x07);
   uint8_t reg08 = ReadReg(0x08);
@@ -505,13 +529,8 @@ void setup() {
   Serial.print(bitrate);
   Serial.println(" kbps...");
 
-  for (int i = 0; i < MAX_IDS; i++) {
-    discoverySent[i] = false;
-    // Serial.print(i);
   }
   
-
-}
 
 void loop() {
   if (!client.connected()) {
@@ -567,31 +586,16 @@ void loop() {
       reason += "Power too high; ";
     }
 
-    /* uint16_t lastResets;
-    double lastConsumption;
-    if (!updateResetTracker(frame.ID, frame.NumberOfResets, frame.Consumption, &lastResets, &lastConsumption)) {
-      valid = false;
-      reason += "Resets not +1 (last=" + String(lastResets) + "); ";
-    } 
-    
-
-    if (!updateResetTracker(frame.ID, frame.NumberOfResets, frame.Consumption, &lastResets, &lastConsumption)) {
-      double delta = frame.Consumption - lastConsumption;
-      if (delta < 0 || delta > 0.025) {
-        valid = false;
-        reason += "Consumption invalid (last=" + String(lastConsumption, 3) + ", delta=" + String(delta, 3) + "); ";
-      }
+    // Publish discovery messages for new IDs
+    /* for (int i = 0; i < MAX_IDS; i++) {
+                String trackerIdStr = String(resetTrackers[i].ID, HEX);
+                trackerIdStr.toUpperCase(); // Falls nötig, zum Vergleich in Großbuchstaben
+                if (trackerIdStr == idStr && resetTrackers[i].Initialized && !discoverySent[i]) {
+                    publishDiscoveryMessages(frame.ID);
+                    discoverySent[i] = true;
+                }
     }
 */
-
-    // Publish discovery messages for new IDs
-    for (int i = 0; i < MAX_IDS; i++) {
-      // Serial.printf("→ Tracker %d, ID: %s, discoverySent: %s\n", i, idStr, discoverySent[i] ? "true" : "false");
-      if ( resetTrackers[i].Initialized && resetTrackers[i].ID == frame.ID && !discoverySent[i]) {
-        publishDiscoveryMessages(frame.ID);
-        discoverySent[i] = true;
-      }
-    }
 
     if (logOnlyFailed) {
       if (!valid) {
