@@ -1,7 +1,6 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include<HaMqttEntities.h>
 
 #include "wifidata.h"
 #include "whitelist.h"
@@ -205,14 +204,14 @@ void publishDiscoveryMessages(uint16_t id) {
   snprintf(state_topic, sizeof(state_topic), "EC3000/%04X", id);
 
   // Device info shared across all entities
-  String device_info = "{\"identifiers\": [\"" + String(device_id) + "\"],"
-                       "\"name\": \"EC3000 Device " + String(id, HEX) + "\","
+  String device_info = "{\"identifiers\": [\"ec3000_BE7A\"],"
+                       "\"name\": \"EC3000 Device BE7A\","
                        "\"manufacturer\": \"DIY\","
                        "\"model\": \"EC3000 Energy Monitor\"}";
 
   // Power sensor
   char power_topic[64];
-  snprintf(power_topic, sizeof(power_topic), "homeassistant/sensor/%s/power/config", device_id);
+  snprintf(power_topic, sizeof(power_topic), "homeassistant/sensor/%s/config", device_id);
   String power_payload = "{\"name\": \"Power\","
                          "\"state_topic\": \"" + String(state_topic) + "\","
                          "\"unit_of_measurement\": \"W\","
@@ -292,6 +291,8 @@ void publishDiscoveryMessages(uint16_t id) {
 
   Serial.print("Published discovery messages for ID: 0x");
   Serial.println(id, HEX);
+  // Serial.println(power_topic);
+  // Serial.println(power_payload);
 }
 
 void reconnect() {
@@ -422,6 +423,7 @@ void setup() {
   }
   Serial.println("\nWiFi connected");
 
+  client.setBufferSize(1024);  // oder 512 – je nach Bedarf
   client.setServer(mqtt_server, mqtt_port);
 
   pinMode(RFM69_CS, OUTPUT);
@@ -502,6 +504,13 @@ void setup() {
   Serial.print(" MHz with ");
   Serial.print(bitrate);
   Serial.println(" kbps...");
+
+  for (int i = 0; i < MAX_IDS; i++) {
+    discoverySent[i] = false;
+    // Serial.print(i);
+  }
+  
+
 }
 
 void loop() {
@@ -553,7 +562,7 @@ void loop() {
       reason += "IsOn=No but Power>0; ";
     }
 
-    if (frame.Power > 3000) {
+    if (frame.Power > 3500) {
       valid = false;
       reason += "Power too high; ";
     }
@@ -577,7 +586,8 @@ void loop() {
 
     // Publish discovery messages for new IDs
     for (int i = 0; i < MAX_IDS; i++) {
-      if (resetTrackers[i].Initialized && resetTrackers[i].ID == frame.ID && !discoverySent[i]) {
+      // Serial.printf("→ Tracker %d, ID: %s, discoverySent: %s\n", i, idStr, discoverySent[i] ? "true" : "false");
+      if ( !discoverySent[i]) {
         publishDiscoveryMessages(frame.ID);
         discoverySent[i] = true;
       }
