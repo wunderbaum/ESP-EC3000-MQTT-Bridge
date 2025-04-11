@@ -211,9 +211,10 @@ void publishDiscoveryMessages(uint16_t id) {
   // Power sensor
   char power_topic[64];
   
-  snprintf(power_topic, sizeof(power_topic), "homeassistant/sensor/%s/config", device_id);
+  snprintf(power_topic, sizeof(power_topic), "homeassistant/sensor/%s/power/config", device_id);
   String power_payload = "{\"name\": \"Power\","
                  "\"state_topic\": \"" + String(state_topic) + "\","
+                 "\"unique_id\": \"" + String(id, HEX) + "_power\","
                  "\"unit_of_measurement\": \"W\","
                  "\"value_template\": \"{{ value_json.Power }}\","
                  "\"device_class\": \"power\","
@@ -233,6 +234,7 @@ void publishDiscoveryMessages(uint16_t id) {
   snprintf(consumption_topic, sizeof(consumption_topic), "homeassistant/sensor/%s/consumption/config", device_id);
   String consumption_payload = "{\"name\": \"Consumption\","
                                "\"state_topic\": \"" + String(state_topic) + "\","
+                               "\"unique_id\": \"" + String(id, HEX) + "_consumption\","
                                "\"unit_of_measurement\": \"kWh\","
                                "\"value_template\": \"{{ value_json.Consumption }}\","
                                "\"device\": " + device_info + "}";
@@ -243,6 +245,7 @@ void publishDiscoveryMessages(uint16_t id) {
   snprintf(total_seconds_topic, sizeof(total_seconds_topic), "homeassistant/sensor/%s/total_seconds/config", device_id);
   String total_seconds_payload = "{\"name\": \"Total Seconds\","
                                  "\"state_topic\": \"" + String(state_topic) + "\","
+                                 "\"unique_id\": \"" + String(id, HEX) + "_total_seconds\","
                                  "\"unit_of_measurement\": \"s\","
                                  "\"value_template\": \"{{ value_json.TotalSeconds }}\","
                                  "\"device\": " + device_info + "}";
@@ -253,6 +256,7 @@ void publishDiscoveryMessages(uint16_t id) {
   snprintf(on_seconds_topic, sizeof(on_seconds_topic), "homeassistant/sensor/%s/on_seconds/config", device_id);
   String on_seconds_payload = "{\"name\": \"On Seconds\","
                               "\"state_topic\": \"" + String(state_topic) + "\","
+                              "\"unique_id\": \"" + String(id, HEX) + "_on_seconds\","
                               "\"unit_of_measurement\": \"s\","
                               "\"value_template\": \"{{ value_json.OnSeconds }}\","
                               "\"device\": " + device_info + "}";
@@ -263,6 +267,7 @@ void publishDiscoveryMessages(uint16_t id) {
   snprintf(max_power_topic, sizeof(max_power_topic), "homeassistant/sensor/%s/max_power/config", device_id);
   String max_power_payload = "{\"name\": \"Maximum Power\","
                              "\"state_topic\": \"" + String(state_topic) + "\","
+                             "\"unique_id\": \"" + String(id, HEX) + "_max_power\","
                              "\"unit_of_measurement\": \"W\","
                              "\"value_template\": \"{{ value_json.MaximumPower }}\","
                              "\"device\": " + device_info + "}";
@@ -273,6 +278,7 @@ void publishDiscoveryMessages(uint16_t id) {
   snprintf(resets_topic, sizeof(resets_topic), "homeassistant/sensor/%s/resets/config", device_id);
   String resets_payload = "{\"name\": \"Number of Resets\","
                           "\"state_topic\": \"" + String(state_topic) + "\","
+                          "\"unique_id\": \"" + String(id, HEX) + "_resets\","
                           "\"value_template\": \"{{ value_json.NumberOfResets }}\","
                           "\"device\": " + device_info + "}";
   client.publish(resets_topic, resets_payload.c_str(), true);
@@ -282,6 +288,7 @@ void publishDiscoveryMessages(uint16_t id) {
   snprintf(is_on_topic, sizeof(is_on_topic), "homeassistant/binary_sensor/%s/is_on/config", device_id);
   String is_on_payload = "{\"name\": \"Is On\","
                          "\"state_topic\": \"" + String(state_topic) + "\","
+                         "\"unique_id\": \"" + String(id, HEX) + "_is_on\","
                          "\"value_template\": \"{{ value_json.IsOn }}\","
                          "\"payload_on\": \"1\","
                          "\"payload_off\": \"0\","
@@ -293,6 +300,7 @@ void publishDiscoveryMessages(uint16_t id) {
   snprintf(rssi_topic, sizeof(rssi_topic), "homeassistant/sensor/%s/rssi/config", device_id);
   String rssi_payload = "{\"name\": \"RSSI\","
                         "\"state_topic\": \"" + String(state_topic) + "\","
+                        "\"unique_id\": \"" + String(id, HEX) + "_rssi\","
                         "\"unit_of_measurement\": \"dBm\","
                         "\"value_template\": \"{{ value_json.RSSI }}\","
                         "\"device\": " + device_info + "}";
