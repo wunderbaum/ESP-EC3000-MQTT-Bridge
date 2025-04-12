@@ -25,6 +25,9 @@
 // Logging toggle
 bool logOnlyFailed = true; // true = log only failed, false = log all
 
+unsigned long lastStatusPublish = 0;
+
+
 // Payload buffer
 uint8_t m_payload[64];
 uint8_t m_payloadPointer = 0;
@@ -250,6 +253,8 @@ void publishDiscoveryMessages(uint16_t id) {
                                  "\"unique_id\": \"" + String(id, HEX) + "_total_seconds\","
                                  "\"unit_of_measurement\": \"s\","
                                  "\"value_template\": \"{{ value_json.TotalSeconds }}\","
+                                 "\"device_class\": \"duration\","
+                                 "\"state_class\": \"total_increasing\","
                                  "\"device\": " + device_info + "}";
   client.publish(total_seconds_topic, total_seconds_payload.c_str(), true);
 
@@ -261,6 +266,8 @@ void publishDiscoveryMessages(uint16_t id) {
                               "\"unique_id\": \"" + String(id, HEX) + "_on_seconds\","
                               "\"unit_of_measurement\": \"s\","
                               "\"value_template\": \"{{ value_json.OnSeconds }}\","
+                              "\"device_class\": \"duration\","
+                              "\"state_class\": \"total_increasing\","
                               "\"device\": " + device_info + "}";
   client.publish(on_seconds_topic, on_seconds_payload.c_str(), true);
 
@@ -429,9 +436,28 @@ void printFrame(struct Frame* frame, float rssi) {
   Serial.print("CRC: 0x"); Serial.println(frame->CRC, HEX);
 }
 
+void publishSystemStatus(uint16_t id) {
+  char topic[32];
+  snprintf(topic, sizeof(topic), "EC3000/system", id);
+
+  // Systemdaten sammeln
+  unsigned long uptime = millis() / 1000; // Sekunden
+  int32_t rssi = WiFi.RSSI();             // dBm
+  uint32_t freeHeap = ESP.getFreeHeap();  // Bytes
+
+  // JSON-Nachricht bauen
+  String payload = "{";
+  payload += "\"Uptime\":" + String(uptime) + ",";
+  payload += "\"WiFiRSSI\":" + String(rssi) + ",";
+  payload += "\"FreeHeap\":" + String(freeHeap);
+  payload += "}";
+
+  client.publish(topic, payload.c_str());
+}
+
 void setup() {
   Serial.begin(115200);
-  while (!Serial) delay(10);
+  // while (!Serial) delay(10);
   delay(2000);
 
   WiFi.begin(ssid, password);
@@ -546,6 +572,12 @@ void loop() {
   if (!client.connected()) {
     reconnect();
   }
+
+  if (millis() - lastStatusPublish > 30000) {
+    publishSystemStatus(0xDEAD); // Beispiel-ID
+    lastStatusPublish = millis();
+  }
+
   client.loop();
 
   cleanStaleIDs();
