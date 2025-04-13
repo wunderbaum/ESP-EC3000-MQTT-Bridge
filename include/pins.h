@@ -9,21 +9,23 @@
 // PIN 9 ist der "BO0" Knopf
 
 // Pin definitions RFM69
+#ifdef INCLUDES2
 #define RFM69_CS   34  // NSS (Chip Select)
 #define RFM69_INT  5   // DIO0 (Interrupt) NOT USED - you do NOT need to connect it!
 #define RFM69_MOSI 35  // SPI MOSI
 #define RFM69_MISO 37  // SPI MISO
 #define RFM69_SCK  36  // SPI SCK
 #define RFM69_RST  18  // RESET - USED; but it also works without because the RFM69 is in working state when this pin is not connected.
+#define LED_PIN 8                 // (fest auf der Platine verdrahtet)
+#endif
 
+#ifdef INCLUDEC3
 // Pin Definitionen RFM69 (frei wählbar) an ESP32-C3 mit 0,42" OLED
-/* 
 #define RFM69_CS 7
 #define RFM69_MOSI 3
 #define RFM69_MISO 10
 #define RFM69_SCK 4
 #define RFM69_RST 2
-*/
 
 // Hersteller Pin Definitionen 0.42" OLED auf dem günstigen ESP32-C3 Board
 #define OLED_SCL 6  // (fest auf der Platine zum Display verdrahtet)
@@ -31,3 +33,4 @@
 
 // Hersteller Pin Definitionen der auf dem Board verbauten LED
 #define LED_PIN 8                 // (fest auf der Platine verdrahtet)
+#endif
