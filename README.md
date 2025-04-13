@@ -6,6 +6,8 @@ Wunderbaums changes:
 
 - Es gibt nun auch eine Unterstützung für die ESP32-C3-supermini mit OLED, danke an yustanotheruser!
 
+- platformio.ini unterscheidet jetzt 2 verschiedene ESP-boards. Das S2-Mini und das C3-super-mini mit dem 0.42" Display.
+
 
 # ESP-EC3000-MQTT-Bridge
 Empfängt EC3000-Pakete und dekodiert sie über einen RFM69, der mit einem ESP8266/ESP32 verbunden ist, und sendet sie nach einigen Plausibilitätsprüfungen an MQTT.
