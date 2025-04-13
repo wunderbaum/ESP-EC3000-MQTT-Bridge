@@ -1,17 +1,20 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <U8g2lib.h>
 
 #include "wifidata.h"
 #include "whitelist.h"
+#include "pins.h"
+#include "fonts.h"
 
-// Pin definitions
-#define RFM69_CS   34  // NSS (Chip Select)
-#define RFM69_INT  5   // DIO0 (Interrupt) NOT USED - you do NOT need to connect it!
-#define RFM69_MOSI 35  // SPI MOSI
-#define RFM69_MISO 37  // SPI MISO
-#define RFM69_SCK  36  // SPI SCK
-#define RFM69_RST  18  // RESET - USED; but it also works without because the RFM69 is in working state when this pin is not connected.
+// LED Eigenschaften
+#define LED_VALID_DURATION 3      // 3ms for valid packets
+#define LED_INVALID_DURATION 60   // 10ms for invalid packets
+#define LED_VALID_BRIGHTNESS 250  // ~2% brightness for valid (0 = brightest, 255 = off)
+#define LED_INVALID_BRIGHTNESS 0  // Full brightness for invalid
+#define LED_PWM_FREQ 5000         // 5kHz PWM frequency
+#define LED_PWM_RESOLUTION 8      // 8-bit resolution (0-255)
 
 #define FREQUENCY_KHZ  868300
 #define DATA_RATE      20000
@@ -21,6 +24,36 @@
 
 #define PAYLOAD_SIZE 47
 #define FRAME_LENGTH 38
+
+// Behandlung des "BO0" Knopfes
+#define LONG_PRESS_DURATION 500   // 500ms for font change
+
+// Anzeigelänge des Popups beim Fontwechsel
+#define FONT_POPUP_DURATION 1250  // 1250ms popup with the current font array number
+
+// Global variables for LED timing
+unsigned long ledValidOnTime = 0;
+unsigned long ledInvalidOnTime = 0;
+bool ledValidIsOn = false;
+bool ledInvalidIsOn = false;
+
+// Fontcounter popup
+unsigned long fontPopupStart = 0;  // Popup timer
+bool showFontPopup = false;        // Popup state
+
+// Display initialization
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, 6, 5);
+// Display buffer dimensions
+const unsigned int BufferWidth = 132;
+const unsigned int BufferHeight = 64;
+const unsigned int ScreenWidth = 72;
+const unsigned int ScreenHeight = 40;
+const unsigned int xOffset = (BufferWidth - ScreenWidth) / 2;
+const unsigned int yOffset = (BufferHeight - ScreenHeight) / 2;
+
+// Define constants and variables
+const int buttonPin = 9;                  // GPIO pin for the button
+const unsigned long debounceDelay = 250;  // Debounce delay in milliseconds
 
 // Logging toggle
 bool logOnlyFailed = true; // true = log only failed, false = log all
@@ -68,6 +101,29 @@ struct Tracker {
 // WiFi and MQTT clients
 WiFiClient espClient;
 PubSubClient client(espClient);
+
+// Display page management
+struct DisplayPage {
+  uint16_t ID;
+  float Power;
+  double Consumption;
+  unsigned long lastUpdate;
+  bool active;
+};
+
+DisplayPage displayPages[MAX_IDS];
+uint8_t currentPage = 0;
+uint8_t totalPages = 0;
+
+// Fontswitching
+uint8_t currentFontIndex = 0;        // Start with first font
+unsigned long buttonPressStart = 0;  // Track press start time
+bool buttonIsPressed = false;        // Track press state
+
+// Variables to track button state and timing
+bool lastButtonState = HIGH;         // Previous state of the button (HIGH due to INPUT_PULLUP)
+bool currentButtonState = HIGH;      // Current state of the button
+unsigned long lastDebounceTime = 0;  // Last time the button state changed
 
 void debugLog(const String& msg) {
   // TODO: Make it actually worship the login bool more as it currently is a bit messy in the console.... :/
@@ -473,6 +529,140 @@ bool checkConsumption(uint16_t id, double consumption, double* lastConsumption) 
   return false;
 }
 
+void updateDisplayPage(uint16_t id, float power, double consumption) {
+  unsigned long now = millis();
+
+  // Find existing page or create new
+  for (int i = 0; i < MAX_IDS; i++) {
+    if (displayPages[i].active && displayPages[i].ID == id) {
+      displayPages[i].Power = power;
+      displayPages[i].Consumption = consumption;
+      displayPages[i].lastUpdate = now;
+      return;
+    }
+  }
+
+  // Create new page if space available
+  for (int i = 0; i < MAX_IDS; i++) {
+    if (!displayPages[i].active) {
+      displayPages[i].ID = id;
+      displayPages[i].Power = power;
+      displayPages[i].Consumption = consumption;
+      displayPages[i].lastUpdate = now;
+      displayPages[i].active = true;
+      totalPages++;
+      return;
+    }
+  }
+}
+
+void drawDisplay() {
+  u8g2.clearBuffer();
+  if (showFontPopup && millis() - fontPopupStart < FONT_POPUP_DURATION) {
+    // Popup: show font index only
+    u8g2.setFont(u8g2_font_fub30_tn);  // Large numeric font (~30px)
+    char popup[3];
+    snprintf(popup, sizeof(popup), "%d", currentFontIndex);
+    int width = u8g2.getStrWidth(popup);
+    int height = u8g2.getFontAscent() - u8g2.getFontDescent();
+    int x = xOffset + (ScreenWidth - width) / 2;    // Center horizontally
+    int y = yOffset + (ScreenHeight - height) / 2;  // Center vertically
+    u8g2.setCursor(x, y);
+    u8g2.print(popup);
+    Serial.println("Drawing popup: " + String(popup));
+  } else {
+    // Normal display
+    showFontPopup = false;  // Hide popup after 3s
+    u8g2.setFont(fonts[currentFontIndex]);
+    if (totalPages == 0) {
+      u8g2.setCursor(xOffset, yOffset);
+      u8g2.print("...");  // Show that we are still Waiting for the very first packets ... only seen at system startup until the first packet comes in
+    } else {
+      // Find the actual page index
+      int displayIndex = 0;
+      for (int i = 0, count = 0; i < MAX_IDS; i++) {
+        if (displayPages[i].active) {
+          if (count == currentPage) {
+            displayIndex = i;
+            break;
+          }
+          count++;
+        }
+      }
+      // Calculate loading bar progress (5 seconds total)
+      unsigned long elapsed = millis() - displayPages[displayIndex].lastUpdate;
+      int barWidth = (elapsed * ScreenWidth) / 5000;
+      if (barWidth > ScreenWidth) {
+        barWidth = ScreenWidth;
+      }
+
+      // Draw content with current font
+      u8g2.setFont(fonts[currentFontIndex]);
+      char buffer[20];
+
+      // ID
+      snprintf(buffer, sizeof(buffer), "%04X ID", displayPages[displayIndex].ID);
+      u8g2.setCursor(xOffset, yOffset);
+      u8g2.print(buffer);
+
+      // Loading bar
+      u8g2.drawHLine(xOffset, yOffset + 13, barWidth);
+
+      // Power
+      snprintf(buffer, sizeof(buffer), "%.1f W", displayPages[displayIndex].Power);
+      u8g2.setCursor(xOffset, yOffset + 14);
+      u8g2.print(buffer);
+
+      // Consumption
+      snprintf(buffer, sizeof(buffer), "%.3f KWH", displayPages[displayIndex].Consumption);
+      u8g2.setCursor(xOffset, yOffset + 28);
+      u8g2.print(buffer);
+    }
+  }
+  u8g2.sendBuffer();
+}
+
+void handleButton() {
+  int reading = digitalRead(buttonPin);
+  // Serial.print("Button reading: ");
+  // Serial.println(reading); // Show the button state (must be "1" !!!)
+
+  if (reading == LOW && lastButtonState == HIGH) {
+    // Button just pressed
+    buttonPressStart = millis();
+    buttonIsPressed = true;
+    Serial.println("Button pressed - starting timer");
+  } else if (reading == HIGH && lastButtonState == LOW) {
+    // Button released
+    unsigned long pressDuration = millis() - buttonPressStart;
+    buttonIsPressed = false;
+    if (pressDuration < LONG_PRESS_DURATION) {
+      // Short press: cycle page
+      if (totalPages > 0) {
+        currentPage = (currentPage + 1) % totalPages;
+        Serial.println("Short press - Cycling to page: " + String(currentPage));
+        drawDisplay();
+      } else {
+        Serial.println("Short press - No pages to cycle");
+      }
+    }
+    Serial.println("Button released - duration: " + String(pressDuration) + "ms");
+  } else if (buttonIsPressed && reading == LOW) {
+    // Button held
+    unsigned long pressDuration = millis() - buttonPressStart;
+    if (pressDuration >= LONG_PRESS_DURATION) {
+      // Long press: cycle font
+      currentFontIndex = (currentFontIndex + 1) % numFonts;
+      fontPopupStart = millis();
+      showFontPopup = true;
+      Serial.println("Long press - Cycling to font index: " + String(currentFontIndex));
+      drawDisplay();
+      buttonIsPressed = false;  // Prevent repeat triggers
+    }
+  }
+  lastButtonState = reading;
+}
+
 void cleanStaleIDs() {
   unsigned long now = millis();
   for (int i = 0; i < MAX_IDS; i++) {
@@ -523,6 +713,27 @@ void publishSystemStatus(uint16_t id) {
 }
 
 void setup() {
+    // Initialize display
+    u8g2.begin();
+    // u8g2.setFont(u8g2_font_8bitclassic_tr); // Set a readable font
+    u8g2.setFont(u8g2_font_missingplanet_tr);
+    // u8g2.setFont(u8g2_font_questgiver_tr);
+    // u8g2.setFont(u8g2_font_crox1tb_tr);
+    // u8g2.setFont(u8g2_font_lastapprenticethin_tr);
+    // u8g2.setFont(u8g2_font_eckpixel_tr);
+    // u8g2.setFont(u8g2_font_tenthinnerguys_tr);
+    // u8g2.setFont(u8g2_font_NokiaSmallBold_tr);
+    // u8g2.setFontRefHeightExtendedText();
+    u8g2.setDrawColor(1);
+    u8g2.setBusClock(25000000);
+    u8g2.setFontPosTop();
+    u8g2.setContrast(255);
+    // u8g2.setFontDirection(0);
+    u8g2.clearBuffer();
+    u8g2.setCursor(xOffset, yOffset);
+    u8g2.print("EC3000 MQTT Bridge");
+    u8g2.sendBuffer();
+  
   Serial.begin(115200);
   // while (!Serial) delay(10);
   delay(2000);
@@ -534,6 +745,9 @@ void setup() {
   }
   Serial.println("\nWiFi connected");
   Serial.println(WiFi.localIP());
+  u8g2.setCursor(xOffset, yOffset + 14);
+  u8g2.print("WLAN verbunden!");
+  u8g2.sendBuffer();
 
   client.setBufferSize(1024);  
   client.setServer(mqtt_server, mqtt_port);
@@ -568,24 +782,37 @@ void setup() {
   WriteReg(REG_PAYLOADLENGTH, 0x0A);
   if (ReadReg(REG_PAYLOADLENGTH) != 0x0A) {
     Serial.println("RFM69 detection failed at step 1!");
+    u8g2.setCursor(xOffset, yOffset + 14);
+    u8g2.print("No RFM69");
+    u8g2.setCursor(xOffset, yOffset + 28);
+    u8g2.print("found!!");
+    u8g2.sendBuffer();
     while (1);
   }
   WriteReg(REG_PAYLOADLENGTH, 0x40);
   if (ReadReg(REG_PAYLOADLENGTH) != 0x40) {
     Serial.println("RFM69 detection failed at step 2!");
+    u8g2.setCursor(xOffset, yOffset + 14);
+    u8g2.print("No RFM69");
+    u8g2.setCursor(xOffset, yOffset + 28);
+    u8g2.print("found!!");
+    u8g2.sendBuffer();
     while (1);
   }
   Serial.println("RFM69 detected!");
 
+  // Set RFM69 Frequency to 868.3 MhZ
   unsigned long f = (((FREQUENCY_KHZ * 1000UL) << 2) / (32000000UL >> 11)) << 6;
   WriteReg(0x07, f >> 16);
   WriteReg(0x08, f >> 8);
   WriteReg(0x09, f);
 
+  // Set RFM69 Datarate to 20000 baud (20kbps)
   uint16_t r = ((32000000UL + (DATA_RATE / 2)) / DATA_RATE);
   WriteReg(0x03, r >> 8);
   WriteReg(0x04, r & 0xFF);
-
+  
+  // Set EC3000 Preamble Bytes and Modulation and so on...
   WriteReg(0x02, 0x00);
   WriteReg(0x05, 0x01);
   WriteReg(0x06, 0x48);
@@ -610,6 +837,9 @@ void setup() {
   WriteReg(REG_OPMODE, (ReadReg(REG_OPMODE) & 0xE3) | 0x10);
 
   Serial.println("RFM69 initialized successfully!");
+  u8g2.setCursor(xOffset, yOffset + 28);
+  u8g2.print("Found RFM69");
+  u8g2.sendBuffer();
 
   for (int i = 0; i < whitelistSize; i++) {
     uint16_t id = strtol(whitelist[i], nullptr, 16);  // Umwandlung von Hex-String zu uint16_t
@@ -635,7 +865,6 @@ void setup() {
 
   }
   
-
 void loop() {
   if (!client.connected()) {
     reconnect();
@@ -649,6 +878,8 @@ void loop() {
   client.loop();
 
   cleanStaleIDs();
+
+  handleButton();
 
   if (ReadReg(REG_IRQFLAGS2) & 0x04) {
     m_payloadPointer = 0;
@@ -733,8 +964,33 @@ void loop() {
                frame.TotalSeconds, frame.OnSeconds, frame.Consumption, frame.Power, frame.MaximumPower, frame.NumberOfResets, frame.IsOn, frame.CRC, rssi);
       client.publish(topic, payload);
     }
+  } else {
+    // Full brightness for invalid packet
+    ledcWrite(LED_PIN, LED_INVALID_BRIGHTNESS);  // Full brightness
+    ledInvalidOnTime = millis();
+    ledInvalidIsOn = true;
+    ledValidIsOn = false;  // Cancel any valid flash
+    Serial.println("Invalid packet received - LED ON (full)");
+  }
+  WriteReg(REG_IRQFLAGS2, 0x04);
+  m_payloadReady = false;
 
-    WriteReg(REG_IRQFLAGS2, 0x04);
-    m_payloadReady = false;
+  // Turn LED off after respective durations
+  if (ledValidIsOn && millis() - ledValidOnTime >= LED_VALID_DURATION) {
+    ledcWrite(LED_PIN, 255);  // Off for active-low
+    ledValidIsOn = false;
+    // Serial.println("LED OFF (valid)");
+  }
+  if (ledInvalidIsOn && millis() - ledInvalidOnTime >= LED_INVALID_DURATION) {
+    ledcWrite(LED_PIN, 255);  // Off for active-low
+    ledInvalidIsOn = false;
+    // Serial.println("LED OFF (invalid)");
+  }
+
+  // Periodically refresh display to maintain loading bar animation
+  static unsigned long lastDisplayUpdate = 0;
+  if (millis() - lastDisplayUpdate > 100) {
+    drawDisplay();
+    lastDisplayUpdate = millis();
   }
 }
