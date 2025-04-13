@@ -4,6 +4,8 @@ Wunderbaums changes:
 - added a whitelist in include/whitelist.h
 - made home assistant auto discovery working
 
+- Es gibt nun auch eine Unterstützung für die ESP32-C3-supermini mit OLED, danke an yustanotheruser!
+
 
 # ESP-EC3000-MQTT-Bridge
 Empfängt EC3000-Pakete und dekodiert sie über einen RFM69, der mit einem ESP8266/ESP32 verbunden ist, und sendet sie nach einigen Plausibilitätsprüfungen an MQTT.
