@@ -57,9 +57,25 @@ struct ResetTracker {
   unsigned long LastSeen; // Timestamp in milliseconds
 } resetTrackers[MAX_IDS] = {0};
 
+struct Tracker {
+  uint16_t ID;
+  uint16_t LastResets;
+  double LastConsumption;
+  bool Initialized;
+  unsigned long LastSeen;  // Timestamp in milliseconds
+} trackers[MAX_IDS] = { 0 };
+
 // WiFi and MQTT clients
 WiFiClient espClient;
 PubSubClient client(espClient);
+
+void debugLog(const String& msg) {
+  // TODO: Make it actually worship the login bool more as it currently is a bit messy in the console.... :/
+  Serial.println(msg);
+  if (client.connected()) {
+    client.publish("EC3000/debug", msg.c_str(), true);
+  }
+}
 
 // Track which IDs have had discovery messages sent
 bool discoverySent[MAX_IDS] = {0};
@@ -407,6 +423,56 @@ bool isWhitelisted(String id) {
   return false;
 }
 
+bool checkConsumption(uint16_t id, double consumption, double* lastConsumption) {
+  // Rewritten - version 2
+  unsigned long now = millis();
+  for (int i = 0; i < MAX_IDS; i++) {
+    if (trackers[i].Initialized && trackers[i].ID == id) {
+      *lastConsumption = trackers[i].LastConsumption;
+      double delta = consumption - *lastConsumption;
+      if (!trackers[i].LastConsumption) {
+        trackers[i].LastConsumption = consumption;
+        trackers[i].LastSeen = now;
+        debugLog("Cons Init: ID=0x" + String(id, HEX) + ", Cons=" + String(consumption, 3));
+        return true;
+      }
+      if (delta == 0) {  // Nur wenn Delta gleich Null ist, ist es "OK"
+        debugLog("Cons Same: ID=0x" + String(id, HEX) + ", Last=" + String(*lastConsumption, 3) + ", New=" + String(consumption, 3) + ", Delta=" + String(delta, 3));
+        trackers[i].LastSeen = now;
+        trackers[i].LastConsumption = consumption;  // Aktualisiere auch den letzten Verbrauch
+        return true;
+      }
+      if (delta < 0) {
+        debugLog("Cons Invalid: ID=0x" + String(id, HEX) + ", Last=" + String(*lastConsumption, 3) + ", New=" + String(consumption, 3) + ", Delta=" + String(delta, 3));
+        trackers[i].LastSeen = now;
+        return false;  // Negative Änderung ist ungültig
+      }
+      if (delta > 0.025) {
+        debugLog("Cons Failed: ID=0x" + String(id, HEX) + ", Last=" + String(*lastConsumption, 3) + ", New=" + String(consumption, 3) + ", Delta=" + String(delta, 3));
+        trackers[i].LastSeen = now;
+        return false;
+      }
+      trackers[i].LastConsumption = consumption;
+      trackers[i].LastSeen = now;
+      debugLog("Cons OK: ID=0x" + String(id, HEX) + ", Cons=" + String(consumption, 3));
+      return true;
+    }
+  }
+  for (int i = 0; i < MAX_IDS; i++) {
+    if (!trackers[i].Initialized) {
+      trackers[i].ID = id;
+      trackers[i].LastResets = 0;
+      trackers[i].LastConsumption = consumption;
+      trackers[i].Initialized = true;
+      trackers[i].LastSeen = now;
+      *lastConsumption = consumption;
+      debugLog("Cons Fallback Init: ID=0x" + String(id, HEX) + ", Cons=" + String(consumption, 3));
+      return true;
+    }
+  }
+  return false;
+}
+
 void cleanStaleIDs() {
   unsigned long now = millis();
   for (int i = 0; i < MAX_IDS; i++) {
@@ -449,9 +515,10 @@ void publishSystemStatus(uint16_t id) {
   String payload = "{";
   payload += "\"Uptime\":" + String(uptime) + ",";
   payload += "\"WiFiRSSI\":" + String(rssi) + ",";
+  payload += "\"IP\":" + String(WiFi.localIP().toString().c_str()) + ",";
   payload += "\"FreeHeap\":" + String(freeHeap);
   payload += "}";
-
+  Serial.print(payload);
   client.publish(topic, payload.c_str());
 }
 
@@ -466,6 +533,7 @@ void setup() {
     Serial.print(".");
   }
   Serial.println("\nWiFi connected");
+  Serial.println(WiFi.localIP());
 
   client.setBufferSize(1024);  
   client.setServer(mqtt_server, mqtt_port);
@@ -628,16 +696,11 @@ void loop() {
       reason += "Power too high; ";
     }
 
-    // Publish discovery messages for new IDs
-    /* for (int i = 0; i < MAX_IDS; i++) {
-                String trackerIdStr = String(resetTrackers[i].ID, HEX);
-                trackerIdStr.toUpperCase(); // Falls nötig, zum Vergleich in Großbuchstaben
-                if (trackerIdStr == idStr && resetTrackers[i].Initialized && !discoverySent[i]) {
-                    publishDiscoveryMessages(frame.ID);
-                    discoverySent[i] = true;
-                }
+    double lastConsumption;
+    if (!checkConsumption(frame.ID, frame.Consumption, &lastConsumption)) {
+      valid = false;
+      reason += "Consumption invalid (last=" + String(lastConsumption, 3) + "); ";
     }
-*/
 
     if (logOnlyFailed) {
       if (!valid) {
