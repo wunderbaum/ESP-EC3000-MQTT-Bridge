@@ -66,6 +66,9 @@ uint8_t m_payload[64];
 uint8_t m_payloadPointer = 0;
 bool m_payloadReady = false;
 
+// Reconnect-counter
+uint8_t reconcount = 0;
+
 // Frame structure
 struct Frame {
   uint16_t ID;
@@ -398,14 +401,14 @@ void reconnect() {
     String clientId = "ESP32C3-EC3000-";
     clientId += String(random(0xffff), HEX);
     if (client.connect(clientId.c_str(), mqtt_user, mqtt_password)) {
-      Serial.println("connected");
+      Serial.println("re-connected");
+      reconcount++;
       // Publish discovery messages for known IDs
-      for (int i = 0; i < MAX_IDS; i++) {
-        if (resetTrackers[i].Initialized && !discoverySent[i]) {
-          publishDiscoveryMessages(resetTrackers[i].ID);
-          discoverySent[i] = true;
-        }
+      for (int i = 0; i < whitelistSize; i++) {
+        uint16_t id = strtol(whitelist[i], nullptr, 16);  // Umwandlung von Hex-String zu uint16_t
+        publishDiscoveryMessages(id);
       }
+      
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -706,13 +709,18 @@ void publishSystemStatus(uint16_t id) {
   payload += "\"Uptime\":" + String(uptime) + ",";
   payload += "\"WiFiRSSI\":" + String(rssi) + ",";
   payload += "\"IP\":" + String(WiFi.localIP().toString().c_str()) + ",";
-  payload += "\"FreeHeap\":" + String(freeHeap);
+  payload += "\"FreeHeap\":" + String(freeHeap) + ",";
+  payload += "\"Reconnects\":" + String(reconcount);
   payload += "}";
   Serial.print(payload);
   client.publish(topic, payload.c_str());
 }
 
 void setup() {
+  Serial.begin(115200);
+  // while (!Serial) delay(10);
+  delay(2000);
+
     // Initialize display
     u8g2.begin();
     // u8g2.setFont(u8g2_font_8bitclassic_tr); // Set a readable font
@@ -734,9 +742,14 @@ void setup() {
     u8g2.print("EC3000 MQTT Bridge");
     u8g2.sendBuffer();
   
-  Serial.begin(115200);
-  // while (!Serial) delay(10);
-  delay(2000);
+    // Configure LED PWM with new ESP-IDE > v3 API (in short: it's now ledcAttach instead of ledcAttachSetup and ledcAttachPin)
+    Serial.println(LED_PIN);
+    delay(5000);
+    u8g2.print(LED_PIN);
+    u8g2.sendBuffer();
+    // pinMode(LED_PIN, OUTPUT);
+    ledcAttach(LED_PIN, LED_PWM_FREQ, LED_PWM_RESOLUTION);  // Auto-assigns channel
+    ledcWrite(LED_PIN, 255);                                // Off for active-low
 
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
@@ -752,7 +765,7 @@ void setup() {
   client.setBufferSize(1024);  
   client.setServer(mqtt_server, mqtt_port);
   if (!client.connected()) {
-    if (client.connect("ESP32Client")) {
+    if (client.connect("ESP32C3Client",mqtt_user,mqtt_password)) {
       Serial.println("Verbunden mit dem MQTT-Server!");
     } else {
       Serial.print("Verbindung fehlgeschlagen, rc=");
@@ -966,16 +979,17 @@ void loop() {
     }
   } else {
     // Full brightness for invalid packet
-    ledcWrite(LED_PIN, LED_INVALID_BRIGHTNESS);  // Full brightness
+    /* ledcWrite(LED_PIN, LED_INVALID_BRIGHTNESS);  // Full brightness
     ledInvalidOnTime = millis();
     ledInvalidIsOn = true;
     ledValidIsOn = false;  // Cancel any valid flash
-    Serial.println("Invalid packet received - LED ON (full)");
+    */
+    // Serial.println("Invalid packet received - LED ON (full)");
   }
   WriteReg(REG_IRQFLAGS2, 0x04);
   m_payloadReady = false;
 
-  // Turn LED off after respective durations
+  /* Turn LED off after respective durations
   if (ledValidIsOn && millis() - ledValidOnTime >= LED_VALID_DURATION) {
     ledcWrite(LED_PIN, 255);  // Off for active-low
     ledValidIsOn = false;
@@ -986,11 +1000,13 @@ void loop() {
     ledInvalidIsOn = false;
     // Serial.println("LED OFF (invalid)");
   }
+  */
 
   // Periodically refresh display to maintain loading bar animation
-  static unsigned long lastDisplayUpdate = 0;
+  /* static unsigned long lastDisplayUpdate = 0;
   if (millis() - lastDisplayUpdate > 100) {
     drawDisplay();
     lastDisplayUpdate = millis();
   }
+  */
 }
