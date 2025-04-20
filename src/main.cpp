@@ -2,6 +2,8 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <U8g2lib.h>
+#include <ESPAsyncWebServer.h>
+
 
 #include "wifidata.h"
 #include "whitelist.h"
@@ -24,6 +26,7 @@
 
 #define PAYLOAD_SIZE 47
 #define FRAME_LENGTH 38
+#define EPSILON 0.00001
 
 // Behandlung des "BO0" Knopfes
 #define LONG_PRESS_DURATION 500   // 500ms for font change
@@ -68,6 +71,8 @@ bool m_payloadReady = false;
 
 // Reconnect-counter
 uint8_t reconcount = 0;
+
+AsyncWebServer webserver(80);
 
 // Frame structure
 struct Frame {
@@ -265,10 +270,11 @@ void DecodeFrame(byte *payload, struct Frame *frame) {
   cons |= (uint32_t)(payload[11] & 0x0F) << 24;
   cons |= (uint64_t)payload[34] << 28;
   cons |= (uint64_t)payload[33] << 36;
-  frame->Consumption = cons / 3600000.0;
 
-  frame->Power = ((uint16_t)payload[15] << 8 | payload[16]) / 10.0;
-  frame->MaximumPower = ((uint16_t)payload[17] << 8 | payload[18]) / 10.0;
+  frame->Consumption = round(cons / 3600000.0 * 1000.0) / 1000.0; // force round to 3 decimal places (123.456)
+  frame->Power = round(((uint16_t)payload[15] << 8 | payload[16]) / 10.0 * 10) / 10.0; // force round to 1 decimal place (123.4)
+  frame->MaximumPower = round(((uint16_t)payload[17] << 8 | payload[18]) / 10.0 * 10) / 10.0 ; // force round to 1 decimal place (432.1)
+
   frame->NumberOfResets = (payload[36] << 4) | (payload[37] >> 4);
   frame->IsOn = payload[37] & 0x08;
   frame->Reception = 0;
@@ -483,40 +489,47 @@ bool isWhitelisted(String id) {
 }
 
 bool checkConsumption(uint16_t id, double consumption, double* lastConsumption) {
-  // Rewritten - version 2
   unsigned long now = millis();
+
   for (int i = 0; i < MAX_IDS; i++) {
     if (trackers[i].Initialized && trackers[i].ID == id) {
       *lastConsumption = trackers[i].LastConsumption;
+
       double delta = consumption - *lastConsumption;
+
       if (!trackers[i].LastConsumption) {
         trackers[i].LastConsumption = consumption;
         trackers[i].LastSeen = now;
-        debugLog("Cons Init: ID=0x" + String(id, HEX) + ", Cons=" + String(consumption, 3));
+//        Serial.println("Cons Init: ID=0x" + String(id, HEX) + ", Cons=" + String(consumption, 3));
         return true;
       }
-      if (delta == 0) {  // Nur wenn Delta gleich Null ist, ist es "OK"
-        debugLog("Cons Same: ID=0x" + String(id, HEX) + ", Last=" + String(*lastConsumption, 3) + ", New=" + String(consumption, 3) + ", Delta=" + String(delta, 3));
+
+      if (fabs(delta) < EPSILON) {
+//        Serial.println("Cons Same: ID=0x" + String(id, HEX) + ", Last=" + String(*lastConsumption, 3) + ", New=" + String(consumption, 3) + ", Delta=" + String(delta, 3));
         trackers[i].LastSeen = now;
-        trackers[i].LastConsumption = consumption;  // Aktualisiere auch den letzten Verbrauch
+        trackers[i].LastConsumption = consumption;
         return true;
       }
-      if (delta < 0) {
-        debugLog("Cons Invalid: ID=0x" + String(id, HEX) + ", Last=" + String(*lastConsumption, 3) + ", New=" + String(consumption, 3) + ", Delta=" + String(delta, 3));
-        trackers[i].LastSeen = now;
-        return false;  // Negative Änderung ist ungültig
-      }
-      if (delta > 0.025) {
-        debugLog("Cons Failed: ID=0x" + String(id, HEX) + ", Last=" + String(*lastConsumption, 3) + ", New=" + String(consumption, 3) + ", Delta=" + String(delta, 3));
+
+      if (delta < 0.0) {
+//        Serial.println("Cons Invalid: ID=0x" + String(id, HEX) + ", Last=" + String(*lastConsumption, 3) + ", New=" + String(consumption, 3) + ", Delta=" + String(delta, 3));
         trackers[i].LastSeen = now;
         return false;
       }
+
+      if (delta > 0.025) {
+//        Serial.println("Cons Failed: ID=0x" + String(id, HEX) + ", Last=" + String(*lastConsumption, 3) + ", New=" + String(consumption, 3) + ", Delta=" + String(delta, 3));
+        trackers[i].LastSeen = now;
+        return false;
+      }
+
       trackers[i].LastConsumption = consumption;
       trackers[i].LastSeen = now;
-      debugLog("Cons OK: ID=0x" + String(id, HEX) + ", Cons=" + String(consumption, 3));
+//        Serial.println("Cons OK: ID=0x" + String(id, HEX) + ", Cons=" + String(consumption, 3));
       return true;
     }
   }
+
   for (int i = 0; i < MAX_IDS; i++) {
     if (!trackers[i].Initialized) {
       trackers[i].ID = id;
@@ -525,10 +538,11 @@ bool checkConsumption(uint16_t id, double consumption, double* lastConsumption) 
       trackers[i].Initialized = true;
       trackers[i].LastSeen = now;
       *lastConsumption = consumption;
-      debugLog("Cons Fallback Init: ID=0x" + String(id, HEX) + ", Cons=" + String(consumption, 3));
+//        Serial.println("Cons Fallback Init: ID=0x" + String(id, HEX) + ", Cons=" + String(consumption, 3));
       return true;
     }
   }
+
   return false;
 }
 
@@ -712,7 +726,7 @@ void publishSystemStatus(uint16_t id) {
   payload += "\"FreeHeap\":" + String(freeHeap) + ",";
   payload += "\"Reconnects\":" + String(reconcount);
   payload += "}";
-  Serial.print(payload);
+  Serial.println(payload);
   client.publish(topic, payload.c_str());
 }
 
@@ -870,6 +884,16 @@ void setup() {
   uint16_t bitrateVal = (reg03 << 8) | reg04;
   float bitrate = 32000000.0 / bitrateVal / 1000.0;
 
+  webserver.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    String html = "<html><body><h2>ESP EC3000</h2>";
+    // html += "<p>Power: " + String(currentPower) + " W</p>";
+    html += "<p>RSSI: " + String(WiFi.RSSI()) + " dBm</p>";
+    html += "<p>Uptime: " + String(millis() / 1000) + " s</p>";
+    html += "</body></html>";
+    request->send(200, "text/html", html);
+  });
+
+  webserver.begin();
   Serial.print("Listening at ");
   Serial.print(freqMHz);
   Serial.print(" MHz with ");
