@@ -25,7 +25,7 @@
 #define REG_IRQFLAGS2  0x28
 
 #define PAYLOAD_SIZE 47
-#define FRAME_LENGTH 38
+#define FRAME_LENGTH 41
 #define EPSILON 0.00001
 
 // Behandlung des "BO0" Knopfes
@@ -85,6 +85,7 @@ struct Frame {
   uint16_t NumberOfResets;
   bool IsOn;
   uint8_t Reception;
+  bool IsValid
   uint16_t CRC;
 };
 
@@ -258,8 +259,14 @@ uint16_t ShiftReverse(byte *payload) {
 void DecodeFrame(byte *payload, struct Frame *frame) {
   DescramblePayload(payload);
   frame->CRC = ShiftReverse(payload);
+  uint32_t mustBeZero = payload[4] + payload[5] + payload[8] + payload[9] + payload[10] + payload[31] + payload[32];
   
   frame->ID = (payload[0] << 8) | payload[1];
+
+  if (frame->CRC == 0xF0B8 && mustBeZero == 0 && frame->ID != 0x00) {
+    frame->IsValid = true;
+  }
+  
   frame->TotalSeconds = (uint32_t)payload[29] << 20 | (uint32_t)payload[30] << 12 | (uint32_t)payload[2] << 8 | (uint32_t)payload[3];
   frame->OnSeconds = (uint32_t)payload[35] << 20 | (uint32_t)payload[36] << 12 | (uint32_t)payload[6] << 8 | (uint32_t)payload[7];
   
@@ -949,6 +956,11 @@ void loop() {
       return;
     }
 
+    if(frame.IsValid == false) {
+      valid = false;
+      reason += "CRC invalid; ";
+    }
+
     if (frame.OnSeconds > frame.TotalSeconds) {
       valid = false;
       reason += "OnSeconds > TotalSeconds; ";
@@ -1033,4 +1045,5 @@ void loop() {
     lastDisplayUpdate = millis();
   }
   */
+
 }
