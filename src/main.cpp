@@ -1,6 +1,7 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Update.h>
 #include <PubSubClient.h>
 #include <esp_task_wdt.h>
 #include <esp_system.h>
@@ -89,6 +90,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>EC3000 Energy Bridge</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f172a'/%3E%3Cpath d='M18 3L7 18h8l-1 11 11-15h-8z' fill='%2338bdf8'/%3E%3C/svg%3E">
 <style>
   :root {
     --bg: #0f172a; --card: #1e293b; --border: #334155;
@@ -108,9 +110,15 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   h1 { font-size: 1.4rem; font-weight: 700; display: flex; align-items: center; gap: 0.6rem; }
   .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
   .dot.offline { background: var(--red); box-shadow: 0 0 8px var(--red); }
-  .sys-pills { display: flex; flex-wrap: wrap; gap: 0.5rem; font-size: 0.8rem; color: var(--muted); }
+  .sys-pills { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; font-size: 0.8rem; color: var(--muted); }
   .pill { background: var(--card); border: 1px solid var(--border); padding: 0.35rem 0.7rem; border-radius: 999px; }
   .pill b { color: var(--text); font-weight: 600; }
+  .ota-link {
+    background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.4);
+    color: var(--accent); text-decoration: none; padding: 0.35rem 0.75rem;
+    border-radius: 999px; font-weight: 600;
+  }
+  .ota-link:hover { background: rgba(56, 189, 248, 0.22); }
   .grid {
     max-width: 1200px; margin: 0 auto;
     display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1rem;
@@ -157,6 +165,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div class="pill">MQTT: <b id="mqttState">-</b></div>
     <div class="pill">Heap: <b id="heap">-</b></div>
     <div class="pill">Reset: <b id="resetReason">-</b></div>
+    <a href="/update" class="ota-link">OTA Update</a>
   </div>
 </header>
 <main class="grid" id="grid">
@@ -245,6 +254,64 @@ async function refresh() {
 
 refresh();
 setInterval(refresh, 2500);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// --- Web-OTA Update Seite im Flash (PROGMEM) ---
+const char UPDATE_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EC3000 OTA Update</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f172a'/%3E%3Cpath d='M18 3L7 18h8l-1 11 11-15h-8z' fill='%2338bdf8'/%3E%3C/svg%3E">
+<style>
+  body { font-family: -apple-system, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+  .box { background: #1e293b; border: 1px solid #334155; border-radius: 14px; padding: 2rem; width: 100%; max-width: 400px; text-align: center; }
+  h2 { margin-top: 0; color: #38bdf8; }
+  input[type=file] { margin: 1.2rem 0; width: 100%; color: #94a3b8; }
+  button { background: #38bdf8; color: #0f172a; border: none; padding: 0.7rem 1.4rem; border-radius: 8px; font-weight: 700; cursor: pointer; width: 100%; font-size: 1rem; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #status { margin-top: 1rem; font-size: 0.9rem; color: #94a3b8; }
+  a { display: inline-block; margin-top: 1.2rem; color: #38bdf8; text-decoration: none; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<div class="box">
+  <h2>Firmware Update (OTA)</h2>
+  <p style="font-size:0.85rem;color:#94a3b8;">Wähle die kompilierte <code>firmware.bin</code> aus PlatformIO aus.</p>
+  <form id="form">
+    <input type="file" id="file" name="update" accept=".bin" required>
+    <button type="submit" id="btn">Firmware hochladen</button>
+  </form>
+  <div id="status"></div>
+  <a href="/">← Zurück zum Dashboard</a>
+</div>
+<script>
+document.getElementById('form').onsubmit = async (e) => {
+  e.preventDefault();
+  const file = document.getElementById('file').files[0];
+  if (!file) return;
+  const btn = document.getElementById('btn');
+  const status = document.getElementById('status');
+  btn.disabled = true;
+  status.textContent = 'Lade hoch und flashe... Bitte nicht trennen.';
+  const formData = new FormData();
+  formData.append('update', file);
+  try {
+    const res = await fetch('/update', { method: 'POST', body: formData });
+    const txt = await res.text();
+    status.textContent = txt;
+    if (res.ok) setTimeout(() => location.href = '/', 4000);
+    else btn.disabled = false;
+  } catch (err) {
+    status.textContent = 'Verbindung getrennt – ESP startet neu...';
+    setTimeout(() => location.href = '/', 4000);
+  }
+};
 </script>
 </body>
 </html>
@@ -573,7 +640,7 @@ bool updateAndCheckTracker(const Frame* frame, float rssi, double* lastConsumpti
   return false;
 }
 
-// --- WebServer Endpunkte (speichersicher per Chunked Transfer) ---
+// --- WebServer Endpunkte (Dashboard, API & OTA-Update) ---
 void handleRoot() {
   server.send_P(200, "text/html", INDEX_HTML);
 }
@@ -623,6 +690,44 @@ void handleApiData() {
 
   server.sendContent("]}");
   server.sendContent("");
+}
+
+void handleUpdatePage() {
+  server.send_P(200, "text/html", UPDATE_HTML);
+}
+
+void handleUpdateUpload() {
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    Serial.printf("OTA Start: %s\n", upload.filename.c_str());
+    setStatusLed(0, 0, LED_BRIGHTNESS); // Blau während OTA
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    esp_task_wdt_reset(); // Watchdog während Flash-Schreibvorgang füttern
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      Serial.printf("OTA Erfolg: %u Bytes. Neustart...\n", upload.totalSize);
+    } else {
+      Update.printError(Serial);
+    }
+  }
+}
+
+void handleUpdateResult() {
+  if (Update.hasError()) {
+    setStatusLed(LED_BRIGHTNESS, 0, 0);
+    server.send(500, "text/plain", "Update fehlgeschlagen! Siehe Serial-Log.");
+  } else {
+    setStatusLed(0, LED_BRIGHTNESS, 0);
+    server.send(200, "text/plain", "Update erfolgreich! ESP32 startet neu...");
+    delay(500);
+    ESP.restart();
+  }
 }
 
 void printFrame(struct Frame* frame, float rssi) {
@@ -680,11 +785,13 @@ void setup() {
     Serial.println(WiFi.localIP());
   }
 
-  // WebServer starten
+  // WebServer & OTA-Routen starten
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/data", HTTP_GET, handleApiData);
+  server.on("/update", HTTP_GET, handleUpdatePage);
+  server.on("/update", HTTP_POST, handleUpdateResult, handleUpdateUpload);
   server.begin();
-  Serial.println("Web dashboard started on port 80");
+  Serial.println("Web dashboard & OTA started on port 80");
 
   client.setBufferSize(1024);
   client.setServer(mqtt_server, mqtt_port);
@@ -736,6 +843,7 @@ void setup() {
   WriteReg(0x18, 0x80);
   WriteReg(0x19, 0x51); // RxBw ~125 kHz
   WriteReg(0x1E, 0x0C); // AFC AutoOn + AutoClearOn
+  WriteReg(0x23, 0x02); // RegRssiConfig: RSSI-Messung aktivieren
   WriteReg(0x28, 0x10);
   WriteReg(0x29, 220);
   WriteReg(0x2E, 0xA0);
@@ -774,6 +882,9 @@ void loop() {
   uint8_t irqFlags2 = ReadReg(REG_IRQFLAGS2);
 
   if (irqFlags2 & 0x04) {
+    // RSSI direkt vor dem FIFO-Reset aus RegRssiValue (0x24) sichern
+    float rssi = -(ReadReg(0x24) / 2.0f);
+
     uint8_t idx = 0;
     while ((ReadReg(REG_IRQFLAGS2) & 0x40) && idx < 64) {
       m_payload[idx++] = GetByteFromFifo();
@@ -781,6 +892,7 @@ void loop() {
 
     if (ReadReg(REG_IRQFLAGS2) & 0x50) {
       WriteReg(REG_IRQFLAGS2, 0x10);
+      WriteReg(0x23, 0x02);
       WriteReg(0x3D, 0x12);
     }
 
@@ -790,8 +902,6 @@ void loop() {
 
       struct Frame frame = {0};
       DecodeFrame(ec3k_payload, &frame);
-
-      float rssi = -(ReadReg(0x27) / 2.0f);
 
       if (!isWhitelisted(frame.ID)) {
         return;
@@ -853,6 +963,7 @@ void loop() {
     }
   } else if (irqFlags2 & 0x10) {
     WriteReg(REG_IRQFLAGS2, 0x10);
+    WriteReg(0x23, 0x02);
     WriteReg(0x3D, 0x12);
   }
 }
