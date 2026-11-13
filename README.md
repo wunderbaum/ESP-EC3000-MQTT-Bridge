@@ -1,3 +1,10 @@
+Falls das irgendwer da draussen noch braucht, ich habe es mit Gemini nochmal etwas aufgehübscht.
+Ergänzt:
+- OTA Updates
+- OLED rausgeworfen
+- Webfrontend
+- Whitelist nun mit Gerätenamen
+
 Wunderbaums changes:
 - made a platformio version out of it.
 - wifi-credentials are now in an external file include/wifidata.h
