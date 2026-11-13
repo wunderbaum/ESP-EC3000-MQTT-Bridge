@@ -1,80 +1,51 @@
 #include <SPI.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include <PubSubClient.h>
-#include <U8g2lib.h>
-#include <ESPAsyncWebServer.h>
-
+#include <esp_task_wdt.h>
+#include <esp_system.h>
 
 #include "wifidata.h"
 #include "whitelist.h"
 #include "pins.h"
-#include "fonts.h"
 
-// LED Eigenschaften
-#define LED_VALID_DURATION 3      // 3ms for valid packets
-#define LED_INVALID_DURATION 60   // 10ms for invalid packets
-#define LED_VALID_BRIGHTNESS 250  // ~2% brightness for valid (0 = brightest, 255 = off)
-#define LED_INVALID_BRIGHTNESS 0  // Full brightness for invalid
-#define LED_PWM_FREQ 5000         // 5kHz PWM frequency
-#define LED_PWM_RESOLUTION 8      // 8-bit resolution (0-255)
+// Watchdog Timeout in Sekunden
+#define WDT_TIMEOUT 15
 
-#define FREQUENCY_KHZ  868300
-#define DATA_RATE      20000
-#define REG_OPMODE     0x01
+// WS2812 Status-LED (falls in pins.h nicht definiert)
+#ifndef WS2812_PIN
+#define WS2812_PIN 16
+#endif
+
+// LED Helligkeit (0-255, gedimmt schont den 3,3V-Regler)
+#define LED_BRIGHTNESS 25
+#define LED_FLASH_MS   40
+
+// RFM69 Konstanten
+#define FREQUENCY_KHZ     868300
+#define DATA_RATE         20000
+#define REG_OPMODE        0x01
+#define REG_IRQFLAGS2     0x28
 #define REG_PAYLOADLENGTH 0x38
-#define REG_IRQFLAGS2  0x28
 
 #define PAYLOAD_SIZE 47
 #define FRAME_LENGTH 41
-#define EPSILON 0.00001
+#define EPSILON      0.00001
 
-// Behandlung des "BO0" Knopfes
-#define LONG_PRESS_DURATION 500   // 500ms for font change
+// Web-Dashboard & Verlaufshistorie
+#define MAX_IDS      32
+#define HISTORY_LEN  30  // Letzte 30 Messwerte pro Gerät für SVG-Sparkline
 
-// Anzeigelänge des Popups beim Fontwechsel
-#define FONT_POPUP_DURATION 1250  // 1250ms popup with the current font array number
-
-// Global variables for LED timing
-unsigned long ledValidOnTime = 0;
-unsigned long ledInvalidOnTime = 0;
-bool ledValidIsOn = false;
-bool ledInvalidIsOn = false;
-
-// Fontcounter popup
-unsigned long fontPopupStart = 0;  // Popup timer
-bool showFontPopup = false;        // Popup state
-
-// Display initialization
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, 6, 5);
-// Display buffer dimensions
-const unsigned int BufferWidth = 132;
-const unsigned int BufferHeight = 64;
-const unsigned int ScreenWidth = 72;
-const unsigned int ScreenHeight = 40;
-const unsigned int xOffset = (BufferWidth - ScreenWidth) / 2;
-const unsigned int yOffset = (BufferHeight - ScreenHeight) / 2;
-
-// Define constants and variables
-const int buttonPin = 9;                  // GPIO pin for the button
-const unsigned long debounceDelay = 250;  // Debounce delay in milliseconds
-
-// Logging toggle
-bool logOnlyFailed = true; // true = log only failed, false = log all
+bool logOnlyFailed = true;
 
 unsigned long lastStatusPublish = 0;
+unsigned long lastMqttReconnectAttempt = 0;
+unsigned long ledOffTime = 0;
+bool ledFlashActive = false;
 
-
-// Payload buffer
 uint8_t m_payload[64];
-uint8_t m_payloadPointer = 0;
-bool m_payloadReady = false;
+uint16_t reconcount = 0;
 
-// Reconnect-counter
-uint8_t reconcount = 0;
-
-AsyncWebServer webserver(80);
-
-// Frame structure
 struct Frame {
   uint16_t ID;
   uint32_t TotalSeconds;
@@ -85,66 +56,234 @@ struct Frame {
   uint16_t NumberOfResets;
   bool IsOn;
   uint8_t Reception;
-  bool IsValid
+  bool IsValid;
   uint16_t CRC;
 };
-
-// Reset and Consumption tracking (max 32 devices)
-#define MAX_IDS 32
-struct ResetTracker {
-  uint16_t ID;
-  uint16_t LastResets;
-  double LastConsumption;
-  bool Initialized;
-  unsigned long LastSeen; // Timestamp in milliseconds
-} resetTrackers[MAX_IDS] = {0};
 
 struct Tracker {
   uint16_t ID;
   uint16_t LastResets;
   double LastConsumption;
+  float LastPower;
+  float MaxPower;
+  uint32_t TotalSeconds;
+  uint32_t OnSeconds;
+  bool IsOn;
+  float LastRSSI;
   bool Initialized;
-  unsigned long LastSeen;  // Timestamp in milliseconds
-} trackers[MAX_IDS] = { 0 };
+  unsigned long LastSeen;
+  uint16_t History[HISTORY_LEN]; // Power * 10 als Ganzzahl (spart RAM)
+  uint8_t HistoryCount;
+  uint8_t HistoryHead;
+} trackers[MAX_IDS] = {0};
 
-// WiFi and MQTT clients
 WiFiClient espClient;
 PubSubClient client(espClient);
+WebServer server(80);
 
-// Display page management
-struct DisplayPage {
-  uint16_t ID;
-  float Power;
-  double Consumption;
-  unsigned long lastUpdate;
-  bool active;
-};
+// --- Modernes Web-Dashboard im Flash (PROGMEM -> 0 Bytes RAM-Verbrauch) ---
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EC3000 Energy Bridge</title>
+<style>
+  :root {
+    --bg: #0f172a; --card: #1e293b; --border: #334155;
+    --text: #f8fafc; --muted: #94a3b8; --accent: #38bdf8;
+    --green: #22c55e; --red: #ef4444;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); padding: 1.25rem;
+  }
+  header {
+    max-width: 1200px; margin: 0 auto 1.5rem auto;
+    display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+    gap: 1rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border);
+  }
+  h1 { font-size: 1.4rem; font-weight: 700; display: flex; align-items: center; gap: 0.6rem; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .dot.offline { background: var(--red); box-shadow: 0 0 8px var(--red); }
+  .sys-pills { display: flex; flex-wrap: wrap; gap: 0.5rem; font-size: 0.8rem; color: var(--muted); }
+  .pill { background: var(--card); border: 1px solid var(--border); padding: 0.35rem 0.7rem; border-radius: 999px; }
+  .pill b { color: var(--text); font-weight: 600; }
+  .grid {
+    max-width: 1200px; margin: 0 auto;
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1rem;
+  }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+    padding: 1.2rem; display: flex; flex-direction: column; gap: 0.9rem;
+    transition: opacity 0.3s ease;
+  }
+  .card.stale { opacity: 0.55; }
+  .card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 0.5rem; }
+  .dev-name { font-weight: 700; font-size: 1.1rem; color: var(--text); }
+  .dev-id { font-family: monospace; font-size: 0.78rem; color: var(--accent); opacity: 0.85; }
+  .badge {
+    font-size: 0.72rem; font-weight: 700; padding: 0.25rem 0.65rem;
+    border-radius: 999px; text-transform: uppercase; letter-spacing: 0.04em; white-space: nowrap;
+  }
+  .badge.on { background: rgba(34, 197, 94, 0.15); color: var(--green); border: 1px solid rgba(34, 197, 94, 0.4); }
+  .badge.off { background: rgba(148, 163, 184, 0.12); color: var(--muted); border: 1px solid var(--border); }
+  .power-row { display: flex; align-items: baseline; justify-content: space-between; }
+  .power-val { font-size: 2.2rem; font-weight: 800; letter-spacing: -0.02em; }
+  .power-unit { font-size: 1rem; color: var(--muted); margin-left: 0.2rem; }
+  .max-val { font-size: 0.8rem; color: var(--muted); }
+  .spark-wrap {
+    width: 100%; height: 54px; background: rgba(15, 23, 42, 0.55);
+    border-radius: 8px; padding: 4px; border: 1px solid rgba(51, 65, 85, 0.6);
+  }
+  svg { width: 100%; height: 100%; overflow: visible; }
+  .stats {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem;
+    padding-top: 0.7rem; border-top: 1px solid var(--border); font-size: 0.8rem;
+  }
+  .stat span { display: block; color: var(--muted); font-size: 0.7rem; }
+  .stat b { font-weight: 600; }
+  .empty { text-align: center; color: var(--muted); padding: 3rem; grid-column: 1 / -1; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span id="connDot" class="dot"></span> EC3000 MQTT Bridge</h1>
+  <div class="sys-pills">
+    <div class="pill">Uptime: <b id="uptime">-</b></div>
+    <div class="pill">WiFi: <b id="wifiRssi">-</b></div>
+    <div class="pill">MQTT: <b id="mqttState">-</b></div>
+    <div class="pill">Heap: <b id="heap">-</b></div>
+    <div class="pill">Reset: <b id="resetReason">-</b></div>
+  </div>
+</header>
+<main class="grid" id="grid">
+  <div class="empty">Warte auf erste Funkpakete auf 868,3 MHz...</div>
+</main>
 
-DisplayPage displayPages[MAX_IDS];
-uint8_t currentPage = 0;
-uint8_t totalPages = 0;
+<script>
+function fmtDuration(sec) {
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m ${sec % 60}s`;
+}
 
-// Fontswitching
-uint8_t currentFontIndex = 0;        // Start with first font
-unsigned long buttonPressStart = 0;  // Track press start time
-bool buttonIsPressed = false;        // Track press state
+function buildSparkline(vals, id) {
+  if (!vals || vals.length < 2) {
+    return `<svg viewBox="0 0 100 30"><line x1="0" y1="25" x2="100" y2="25" stroke="#334155" stroke-width="1.5" stroke-dasharray="3 3"/></svg>`;
+  }
+  const min = Math.min(...vals);
+  const max = Math.max(...vals);
+  const range = (max - min) || 1;
+  const w = 240, h = 44, pad = 3;
+  const pts = vals.map((v, i) => {
+    const x = (i / (vals.length - 1)) * w;
+    const y = h - pad - ((v - min) / range) * (h - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  const linePts = pts.join(' ');
+  const areaPts = `0,${h} ${linePts} ${w},${h}`;
+  return `
+    <svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+      <defs>
+        <linearGradient id="g_${id}" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.35"/>
+          <stop offset="100%" stop-color="#38bdf8" stop-opacity="0.0"/>
+        </linearGradient>
+      </defs>
+      <polygon points="${areaPts}" fill="url(#g_${id})"/>
+      <polyline points="${linePts}" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>`;
+}
 
-// Variables to track button state and timing
-bool lastButtonState = HIGH;         // Previous state of the button (HIGH due to INPUT_PULLUP)
-bool currentButtonState = HIGH;      // Current state of the button
-unsigned long lastDebounceTime = 0;  // Last time the button state changed
+async function refresh() {
+  try {
+    const res = await fetch('/api/data');
+    const data = await res.json();
+    document.getElementById('connDot').className = 'dot' + (data.mqtt ? '' : ' offline');
+    document.getElementById('uptime').textContent = fmtDuration(data.uptime);
+    document.getElementById('wifiRssi').textContent = data.wifiRssi + ' dBm';
+    document.getElementById('mqttState').textContent = data.mqtt ? 'Verbunden' : 'Getrennt';
+    document.getElementById('heap').textContent = Math.round(data.freeHeap / 1024) + ' KB (min ' + Math.round(data.minHeap / 1024) + ')';
+    document.getElementById('resetReason').textContent = data.resetReason;
 
-void debugLog(const String& msg) {
-  // TODO: Make it actually worship the login bool more as it currently is a bit messy in the console.... :/
-  Serial.println(msg);
-  if (client.connected()) {
-    client.publish("EC3000/debug", msg.c_str(), true);
+    const grid = document.getElementById('grid');
+    if (!data.devices || data.devices.length === 0) return;
+
+    grid.innerHTML = data.devices.map(d => {
+      const stale = d.ageSec > 120;
+      return `
+        <div class="card ${stale ? 'stale' : ''}">
+          <div class="card-top">
+            <div>
+              <div class="dev-name">${d.name}</div>
+              <div class="dev-id">ID: 0x${d.id}</div>
+            </div>
+            <span class="badge ${d.isOn ? 'on' : 'off'}">${d.isOn ? 'Aktiv' : 'Aus'} · vor ${d.ageSec}s</span>
+          </div>
+          <div class="power-row">
+            <div><span class="power-val">${d.power.toFixed(1)}</span><span class="power-unit">W</span></div>
+            <div class="max-val">Max: ${d.maxPower.toFixed(1)} W</div>
+          </div>
+          <div class="spark-wrap">${buildSparkline(d.history, d.id)}</div>
+          <div class="stats">
+            <div class="stat"><span>Verbrauch</span><b>${d.consumption.toFixed(3)} kWh</b></div>
+            <div class="stat"><span>Laufzeit</span><b>${fmtDuration(d.onSeconds)}</b></div>
+            <div class="stat"><span>Funk-RSSI</span><b>${d.rssi.toFixed(0)} dBm</b></div>
+          </div>
+        </div>`;
+    }).join('');
+  } catch (e) {
+    document.getElementById('connDot').className = 'dot offline';
   }
 }
 
-// Track which IDs have had discovery messages sent
-bool discoverySent[MAX_IDS] = {0};
+refresh();
+setInterval(refresh, 2500);
+</script>
+</body>
+</html>
+)rawliteral";
 
+// --- WS2812 Hilfsfunktionen ---
+void setStatusLed(uint8_t r, uint8_t g, uint8_t b) {
+  ledFlashActive = false;
+  rgbLedWrite(WS2812_PIN, r, g, b);
+}
+
+void flashStatusLed(uint8_t r, uint8_t g, uint8_t b, uint16_t durationMs = LED_FLASH_MS) {
+  rgbLedWrite(WS2812_PIN, r, g, b);
+  ledOffTime = millis() + durationMs;
+  ledFlashActive = true;
+}
+
+void updateStatusLed() {
+  if (ledFlashActive && (long)(millis() - ledOffTime) >= 0) {
+    rgbLedWrite(WS2812_PIN, 0, 0, 0);
+    ledFlashActive = false;
+  }
+}
+
+// --- Whitelist & Klarname-Abfrage ---
+const char* getDeviceName(uint16_t id) {
+  for (size_t i = 0; i < whitelistSize; i++) {
+    if (whitelist[i].id == id) {
+      return whitelist[i].name;
+    }
+  }
+  return nullptr;
+}
+
+bool isWhitelisted(uint16_t id) {
+  return getDeviceName(id) != nullptr;
+}
+
+// --- RFM69 SPI-Zugriff ---
 void WriteReg(uint8_t addr, uint8_t value) {
   digitalWrite(RFM69_CS, LOW);
   SPI.transfer(addr | 0x80);
@@ -164,6 +303,7 @@ uint8_t GetByteFromFifo() {
   return ReadReg(0x00);
 }
 
+// --- EC3000 Dekodierung ---
 byte Count1bits(uint32_t v) {
   byte c;
   for (c = 0; v; c++) {
@@ -172,7 +312,6 @@ byte Count1bits(uint32_t v) {
   return c;
 }
 
-// EC3000 decoding functions (unchanged)
 void DescramblePayload(byte* payload) {
   byte ctr = PAYLOAD_SIZE;
   uint8_t inpbyte, outbyte = 0;
@@ -182,9 +321,9 @@ void DescramblePayload(byte* payload) {
     for (byte bit = 0; bit < 8; ++bit) {
       byte ibit = (inpbyte & 0x80) >> 7;
       byte obit = ibit ^ (Count1bits(scramshift & 0x31801) & 0x01);
-      scramshift = scramshift << 1 | ibit;
+      scramshift = (scramshift << 1) | ibit;
       inpbyte <<= 1;
-      outbyte = outbyte << 1 | obit;
+      outbyte = (outbyte << 1) | obit;
     }
     *payload++ = outbyte ^ 0xFF;
   }
@@ -196,7 +335,7 @@ uint16_t UpdateCRC(uint16_t crc, byte data) {
   return ((((uint16_t)data << 8) | (crc >> 8)) ^ (uint8_t)(data >> 4) ^ ((uint16_t)data << 3));
 }
 
-void Del0BitsAndRevBits(byte * payload, byte blen) {
+void Del0BitsAndRevBits(byte* payload, byte blen) {
   uint8_t sval, dval, bit;
   uint8_t si, sbi, di, dbi, n1bits;
 
@@ -212,7 +351,7 @@ void Del0BitsAndRevBits(byte * payload, byte blen) {
       }
       if (bit) n1bits++;
       else n1bits = 0;
-      dval = dval >> 1 | bit;
+      dval = (dval >> 1) | bit;
       dbi++;
       if (dbi == 8) {
         payload[di++] = dval;
@@ -223,7 +362,7 @@ void Del0BitsAndRevBits(byte * payload, byte blen) {
   if (dbi) payload[di] = dval >> (uint8_t)(8 - dbi);
 }
 
-void ShiftLeft(byte * payload, byte blen, byte shift) {
+void ShiftLeft(byte* payload, byte blen, byte shift) {
   uint8_t offs, bits, slen, i;
   uint16_t wbuf;
 
@@ -233,13 +372,13 @@ void ShiftLeft(byte * payload, byte blen, byte shift) {
   slen = blen - offs - 1;
   wbuf = payload[offs];
   for (i = 0; i < slen; ++i) {
-    wbuf = wbuf << 8 | payload[i + offs + 1];
+    wbuf = (wbuf << 8) | payload[i + offs + 1];
     payload[i] = wbuf >> bits;
   }
   payload[slen] = wbuf << (uint8_t)(8 - bits);
 }
 
-uint16_t ShiftReverse(byte *payload) {
+uint16_t ShiftReverse(byte* payload) {
   byte rblen = 47;
   uint16_t i, ec3klen;
   uint16_t crc;
@@ -256,20 +395,21 @@ uint16_t ShiftReverse(byte *payload) {
   return crc;
 }
 
-void DecodeFrame(byte *payload, struct Frame *frame) {
+void DecodeFrame(byte* payload, struct Frame* frame) {
+  frame->IsValid = false;
   DescramblePayload(payload);
   frame->CRC = ShiftReverse(payload);
   uint32_t mustBeZero = payload[4] + payload[5] + payload[8] + payload[9] + payload[10] + payload[31] + payload[32];
-  
+
   frame->ID = (payload[0] << 8) | payload[1];
 
-  if (frame->CRC == 0xF0B8 && mustBeZero == 0 && frame->ID != 0x00) {
+  if (frame->CRC == 0xF0B8 && mustBeZero == 0 && frame->ID != 0x0000) {
     frame->IsValid = true;
   }
-  
-  frame->TotalSeconds = (uint32_t)payload[29] << 20 | (uint32_t)payload[30] << 12 | (uint32_t)payload[2] << 8 | (uint32_t)payload[3];
-  frame->OnSeconds = (uint32_t)payload[35] << 20 | (uint32_t)payload[36] << 12 | (uint32_t)payload[6] << 8 | (uint32_t)payload[7];
-  
+
+  frame->TotalSeconds = ((uint32_t)payload[29] << 20) | ((uint32_t)payload[30] << 12) | ((uint32_t)payload[2] << 8) | (uint32_t)payload[3];
+  frame->OnSeconds = ((uint32_t)payload[35] << 20) | ((uint32_t)payload[36] << 12) | ((uint32_t)payload[6] << 8) | (uint32_t)payload[7];
+
   uint64_t cons = 0;
   cons |= payload[14];
   cons |= (uint16_t)payload[13] << 8;
@@ -278,526 +418,278 @@ void DecodeFrame(byte *payload, struct Frame *frame) {
   cons |= (uint64_t)payload[34] << 28;
   cons |= (uint64_t)payload[33] << 36;
 
-  frame->Consumption = round(cons / 3600000.0 * 1000.0) / 1000.0; // force round to 3 decimal places (123.456)
-  frame->Power = round(((uint16_t)payload[15] << 8 | payload[16]) / 10.0 * 10) / 10.0; // force round to 1 decimal place (123.4)
-  frame->MaximumPower = round(((uint16_t)payload[17] << 8 | payload[18]) / 10.0 * 10) / 10.0 ; // force round to 1 decimal place (432.1)
+  frame->Consumption = round(cons / 3600000.0 * 1000.0) / 1000.0;
+  frame->Power = round(((uint16_t)payload[15] << 8 | payload[16]) / 10.0 * 10) / 10.0;
+  frame->MaximumPower = round(((uint16_t)payload[17] << 8 | payload[18]) / 10.0 * 10) / 10.0;
 
   frame->NumberOfResets = (payload[36] << 4) | (payload[37] >> 4);
-  frame->IsOn = payload[37] & 0x08;
+  frame->IsOn = (payload[37] & 0x08) != 0;
   frame->Reception = 0;
 }
 
-// New function to publish Home Assistant discovery messages
+// --- Home Assistant MQTT Discovery (inkl. Klarnamen) ---
+void publishDiscoveryEntity(uint16_t id, const char* component, const char* entityKey, const char* name,
+                            const char* valueTpl, const char* unit, const char* devClass, const char* stateClass, bool isBinary) {
+  char topic[96];
+  char payload[640];
+  char extra[160] = "";
+
+  snprintf(topic, sizeof(topic), "homeassistant/%s/ec3000_%04X/%s/config", component, id, entityKey);
+
+  if (isBinary) {
+    snprintf(extra, sizeof(extra), "\"payload_on\":\"1\",\"payload_off\":\"0\",");
+  } else {
+    int pos = 0;
+    if (unit && unit[0] != '\0') pos += snprintf(extra + pos, sizeof(extra) - pos, "\"unit_of_measurement\":\"%s\",", unit);
+    if (devClass && devClass[0] != '\0') pos += snprintf(extra + pos, sizeof(extra) - pos, "\"device_class\":\"%s\",", devClass);
+    if (stateClass && stateClass[0] != '\0') pos += snprintf(extra + pos, sizeof(extra) - pos, "\"state_class\":\"%s\",", stateClass);
+  }
+
+  const char* devName = getDeviceName(id);
+  char fallbackName[24];
+  if (!devName) {
+    snprintf(fallbackName, sizeof(fallbackName), "EC3000 %04X", id);
+    devName = fallbackName;
+  }
+
+  snprintf(payload, sizeof(payload),
+           "{\"name\":\"%s\",\"state_topic\":\"EC3000/%04X\",\"unique_id\":\"%04x_%s\","
+           "\"value_template\":\"{{ value_json.%s }}\",%s"
+           "\"device\":{\"identifiers\":[\"ec3000_%04X\"],\"name\":\"%s\","
+           "\"manufacturer\":\"DIY\",\"model\":\"EC3000 Energy Monitor\"}}",
+           name, id, id, entityKey, valueTpl, extra, id, devName);
+
+  client.publish(topic, payload, true);
+  client.loop();
+}
+
 void publishDiscoveryMessages(uint16_t id) {
-  char device_id[16];
-  snprintf(device_id, sizeof(device_id), "ec3000_%04X", id);
-  char state_topic[32];
-  snprintf(state_topic, sizeof(state_topic), "EC3000/%04X", id);
+  publishDiscoveryEntity(id, "sensor", "power", "Power", "Power", "W", "power", nullptr, false);
+  publishDiscoveryEntity(id, "sensor", "energy", "Energy", "Consumption", "kWh", "energy", "total_increasing", false);
+  publishDiscoveryEntity(id, "sensor", "total_seconds", "Total Seconds", "TotalSeconds", "s", "duration", "total_increasing", false);
+  publishDiscoveryEntity(id, "sensor", "on_seconds", "On Seconds", "OnSeconds", "s", "duration", "total_increasing", false);
+  publishDiscoveryEntity(id, "sensor", "max_power", "Maximum Power", "MaximumPower", "W", "power", nullptr, false);
+  publishDiscoveryEntity(id, "sensor", "resets", "Number of Resets", "NumberOfResets", nullptr, nullptr, nullptr, false);
+  publishDiscoveryEntity(id, "binary_sensor", "is_on", "Is On", "IsOn", nullptr, nullptr, nullptr, true);
+  publishDiscoveryEntity(id, "sensor", "rssi", "RSSI", "RSSI", "dBm", "signal_strength", nullptr, false);
 
-  // Device info shared across all entities
-  String device_info = "{\"identifiers\": [\"" + String(device_id) + "\"],"
-                       "\"name\": \"EC3000 Device " + String(id, HEX) + "\","
-                       "\"manufacturer\": \"DIY\","
-                       "\"model\": \"EC3000 Energy Monitor\"}";
-  // Power sensor
-  char power_topic[64];
-  
-  snprintf(power_topic, sizeof(power_topic), "homeassistant/sensor/%s/power/config", device_id);
-  String power_payload = "{\"name\": \"Power\","
-                 "\"state_topic\": \"" + String(state_topic) + "\","
-                 "\"unique_id\": \"" + String(id, HEX) + "_power\","
-                 "\"unit_of_measurement\": \"W\","
-                 "\"value_template\": \"{{ value_json.Power }}\","
-                 "\"device_class\": \"power\","
-                 "\"device\": " + device_info + "}";
- // String power_payload = "{\"name\": \"Test\", \"state_topic\": \"EC3000/Test\"}";
-  // client.publish(power_topic, power_payload.c_str(), true);
-  if (!client.publish(power_topic, power_payload.c_str(), true)) {
-    Serial.println("Fehler beim Senden der MQTT-Nachricht.");
-    Serial.println(power_topic);
-    Serial.println(power_payload);
-    Serial.print("Payload Länge: ");
-    Serial.println(power_payload.length());
-  }
-
-  // Consumption sensor
-  char consumption_topic[64];
-  snprintf(consumption_topic, sizeof(consumption_topic), "homeassistant/sensor/%s/energy/config", device_id);
-  String consumption_payload = "{\"name\": \"Energy\","
-                               "\"state_topic\": \"" + String(state_topic) + "\","
-                               "\"unique_id\": \"" + String(id, HEX) + "_energy\","
-                               "\"unit_of_measurement\": \"kWh\","
-                               "\"value_template\": \"{{ value_json.Consumption }}\","
-                               "\"device_class\": \"energy\","
-                               "\"state_class\": \"total_increasing\","
-                               "\"device\": " + device_info + "}";
-  client.publish(consumption_topic, consumption_payload.c_str(), true);
-
-  // Total Seconds sensor
-  char total_seconds_topic[64];
-  snprintf(total_seconds_topic, sizeof(total_seconds_topic), "homeassistant/sensor/%s/total_seconds/config", device_id);
-  String total_seconds_payload = "{\"name\": \"Total Seconds\","
-                                 "\"state_topic\": \"" + String(state_topic) + "\","
-                                 "\"unique_id\": \"" + String(id, HEX) + "_total_seconds\","
-                                 "\"unit_of_measurement\": \"s\","
-                                 "\"value_template\": \"{{ value_json.TotalSeconds }}\","
-                                 "\"device_class\": \"duration\","
-                                 "\"state_class\": \"total_increasing\","
-                                 "\"device\": " + device_info + "}";
-  client.publish(total_seconds_topic, total_seconds_payload.c_str(), true);
-
-  // On Seconds sensor
-  char on_seconds_topic[64];
-  snprintf(on_seconds_topic, sizeof(on_seconds_topic), "homeassistant/sensor/%s/on_seconds/config", device_id);
-  String on_seconds_payload = "{\"name\": \"On Seconds\","
-                              "\"state_topic\": \"" + String(state_topic) + "\","
-                              "\"unique_id\": \"" + String(id, HEX) + "_on_seconds\","
-                              "\"unit_of_measurement\": \"s\","
-                              "\"value_template\": \"{{ value_json.OnSeconds }}\","
-                              "\"device_class\": \"duration\","
-                              "\"state_class\": \"total_increasing\","
-                              "\"device\": " + device_info + "}";
-  client.publish(on_seconds_topic, on_seconds_payload.c_str(), true);
-
-  // Maximum Power sensor
-  char max_power_topic[64];
-  snprintf(max_power_topic, sizeof(max_power_topic), "homeassistant/sensor/%s/max_power/config", device_id);
-  String max_power_payload = "{\"name\": \"Maximum Power\","
-                             "\"state_topic\": \"" + String(state_topic) + "\","
-                             "\"unique_id\": \"" + String(id, HEX) + "_max_power\","
-                             "\"unit_of_measurement\": \"W\","
-                             "\"value_template\": \"{{ value_json.MaximumPower }}\","
-                             "\"device\": " + device_info + "}";
-  client.publish(max_power_topic, max_power_payload.c_str(), true);
-
-  // Number of Resets sensor
-  char resets_topic[64];
-  snprintf(resets_topic, sizeof(resets_topic), "homeassistant/sensor/%s/resets/config", device_id);
-  String resets_payload = "{\"name\": \"Number of Resets\","
-                          "\"state_topic\": \"" + String(state_topic) + "\","
-                          "\"unique_id\": \"" + String(id, HEX) + "_resets\","
-                          "\"value_template\": \"{{ value_json.NumberOfResets }}\","
-                          "\"device\": " + device_info + "}";
-  client.publish(resets_topic, resets_payload.c_str(), true);
-
-  // Is On binary sensor
-  char is_on_topic[64];
-  snprintf(is_on_topic, sizeof(is_on_topic), "homeassistant/binary_sensor/%s/is_on/config", device_id);
-  String is_on_payload = "{\"name\": \"Is On\","
-                         "\"state_topic\": \"" + String(state_topic) + "\","
-                         "\"unique_id\": \"" + String(id, HEX) + "_is_on\","
-                         "\"value_template\": \"{{ value_json.IsOn }}\","
-                         "\"payload_on\": \"1\","
-                         "\"payload_off\": \"0\","
-                         "\"device\": " + device_info + "}";
-  client.publish(is_on_topic, is_on_payload.c_str(), true);
-
-  // RSSI sensor
-  char rssi_topic[64];
-  snprintf(rssi_topic, sizeof(rssi_topic), "homeassistant/sensor/%s/rssi/config", device_id);
-  String rssi_payload = "{\"name\": \"RSSI\","
-                        "\"state_topic\": \"" + String(state_topic) + "\","
-                        "\"unique_id\": \"" + String(id, HEX) + "_rssi\","
-                        "\"unit_of_measurement\": \"dBm\","
-                        "\"value_template\": \"{{ value_json.RSSI }}\","
-                        "\"device\": " + device_info + "}";
-  client.publish(rssi_topic, rssi_payload.c_str(), true);
-
-  Serial.print("Published discovery messages for ID: 0x");
-  Serial.println(id, HEX);
- 
+  Serial.printf("Published discovery messages for %s (0x%04X)\n", getDeviceName(id), id);
 }
 
-void reconnect() {
-  while (!client.connected()) {
-    Serial.print("Connecting to MQTT...");
-    String clientId = "ESP32C3-EC3000-";
-    clientId += String(random(0xffff), HEX);
-    if (client.connect(clientId.c_str(), mqtt_user, mqtt_password)) {
-      Serial.println("re-connected");
-      reconcount++;
-      // Publish discovery messages for known IDs
-      for (int i = 0; i < whitelistSize; i++) {
-        uint16_t id = strtol(whitelist[i], nullptr, 16);  // Umwandlung von Hex-String zu uint16_t
-        publishDiscoveryMessages(id);
+// --- Nicht-blockierendes Verbindungsmanagement ---
+void handleConnections() {
+  if (WiFi.status() != WL_CONNECTED) {
+    setStatusLed(LED_BRIGHTNESS, 0, 0);
+    static unsigned long lastWifiAttempt = 0;
+    if (millis() - lastWifiAttempt > 10000) {
+      lastWifiAttempt = millis();
+      Serial.println("WiFi disconnected, reconnecting...");
+      WiFi.disconnect();
+      WiFi.begin(ssid, password);
+    }
+    return;
+  }
+
+  if (!client.connected()) {
+    setStatusLed(LED_BRIGHTNESS, 0, 0);
+    if (millis() - lastMqttReconnectAttempt > 5000) {
+      lastMqttReconnectAttempt = millis();
+      Serial.print("Connecting to MQTT...");
+      char clientId[32];
+      snprintf(clientId, sizeof(clientId), "ESP32S2-EC3000-%04X", (uint16_t)random(0xffff));
+
+      if (client.connect(clientId, mqtt_user, mqtt_password)) {
+        Serial.println("connected");
+        setStatusLed(0, 0, 0);
+        reconcount++;
+        for (size_t i = 0; i < whitelistSize; i++) {
+          publishDiscoveryMessages(whitelist[i].id);
+        }
+      } else {
+        Serial.printf("failed, rc=%d\n", client.state());
       }
-      
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" retrying in 5 seconds");
-      delay(5000);
     }
   }
 }
 
-void printTimeBreakdown(uint32_t seconds) {
-  uint32_t minutes = seconds / 60;
-  uint32_t hours = minutes / 60;
-  uint32_t days = hours / 24;
-  uint32_t years = days / 365;
-
-  minutes %= 60;
-  hours %= 24;
-  days %= 365;
-
-  Serial.print(" (");
-  if (years) Serial.print(years), Serial.print("y ");
-  if (days || years) Serial.print(days), Serial.print("d ");
-  Serial.print(hours), Serial.print("h ");
-  Serial.print(minutes), Serial.print("m)");
-}
-
-bool updateResetTracker(uint16_t id, uint16_t resets, double consumption, uint16_t* lastResets, double* lastConsumption) {
-  unsigned long now = millis();
-  for (int i = 0; i < MAX_IDS; i++) {
-    if (resetTrackers[i].Initialized && resetTrackers[i].ID == id) {
-      *lastResets = resetTrackers[i].LastResets;
-      *lastConsumption = resetTrackers[i].LastConsumption;
-      if (resets == resetTrackers[i].LastResets || resets == resetTrackers[i].LastResets + 1) {
-        resetTrackers[i].LastResets = resets;
-        resetTrackers[i].LastConsumption = consumption;
-        resetTrackers[i].LastSeen = now;
-        Serial.print("Tracker Update: ID=0x"); Serial.print(id, HEX);
-        Serial.print(", Resets="); Serial.print(resets);
-        Serial.print(", Cons="); Serial.println(consumption, 3);
-        return true;
-      }
-      Serial.print("Tracker Failed (Resets): ID=0x"); Serial.print(id, HEX);
-      Serial.print(", Expected="); Serial.print(*lastResets + 1);
-      Serial.print(", Got="); Serial.println(resets);
-      return false;
-    }
-    if (!resetTrackers[i].Initialized) {
-      resetTrackers[i].ID = id;
-      resetTrackers[i].LastResets = resets;
-      resetTrackers[i].LastConsumption = consumption;
-      resetTrackers[i].Initialized = true;
-      resetTrackers[i].LastSeen = now;
-      *lastResets = resets;
-      *lastConsumption = consumption;
-      Serial.print("Tracker Init: ID=0x"); Serial.print(id, HEX);
-      Serial.print(", Resets="); Serial.print(resets);
-      Serial.print(", Cons="); Serial.println(consumption, 3);
-      return true;
-    }
+// --- Tracker & Historien-Aktualisierung ---
+void pushHistory(Tracker* t, float power) {
+  uint16_t val = (uint16_t)round(power * 10.0f);
+  t->History[t->HistoryHead] = val;
+  t->HistoryHead = (t->HistoryHead + 1) % HISTORY_LEN;
+  if (t->HistoryCount < HISTORY_LEN) {
+    t->HistoryCount++;
   }
-  Serial.println("Too many IDs! Increase MAX_IDS.");
-  return false;
 }
 
-bool isWhitelisted(String id) {
-  for (int i = 0; i < whitelistSize; i++) {
-    if (id.equalsIgnoreCase(whitelist[i])) {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool checkConsumption(uint16_t id, double consumption, double* lastConsumption) {
+bool updateAndCheckTracker(const Frame* frame, float rssi, double* lastConsumption) {
   unsigned long now = millis();
 
   for (int i = 0; i < MAX_IDS; i++) {
-    if (trackers[i].Initialized && trackers[i].ID == id) {
+    if (trackers[i].Initialized && trackers[i].ID == frame->ID) {
       *lastConsumption = trackers[i].LastConsumption;
+      double delta = frame->Consumption - *lastConsumption;
 
-      double delta = consumption - *lastConsumption;
-
-      if (!trackers[i].LastConsumption) {
-        trackers[i].LastConsumption = consumption;
-        trackers[i].LastSeen = now;
-//        Serial.println("Cons Init: ID=0x" + String(id, HEX) + ", Cons=" + String(consumption, 3));
-        return true;
+      if (trackers[i].LastConsumption != 0.0 && fabs(delta) >= EPSILON) {
+        if (delta < 0.0 || delta > 0.025) {
+          return false;
+        }
       }
 
-      if (fabs(delta) < EPSILON) {
-//        Serial.println("Cons Same: ID=0x" + String(id, HEX) + ", Last=" + String(*lastConsumption, 3) + ", New=" + String(consumption, 3) + ", Delta=" + String(delta, 3));
-        trackers[i].LastSeen = now;
-        trackers[i].LastConsumption = consumption;
-        return true;
-      }
-
-      if (delta < 0.0) {
-//        Serial.println("Cons Invalid: ID=0x" + String(id, HEX) + ", Last=" + String(*lastConsumption, 3) + ", New=" + String(consumption, 3) + ", Delta=" + String(delta, 3));
-        trackers[i].LastSeen = now;
-        return false;
-      }
-
-      if (delta > 0.025) {
-//        Serial.println("Cons Failed: ID=0x" + String(id, HEX) + ", Last=" + String(*lastConsumption, 3) + ", New=" + String(consumption, 3) + ", Delta=" + String(delta, 3));
-        trackers[i].LastSeen = now;
-        return false;
-      }
-
-      trackers[i].LastConsumption = consumption;
+      trackers[i].LastConsumption = frame->Consumption;
+      trackers[i].LastPower = frame->Power;
+      trackers[i].MaxPower = frame->MaximumPower;
+      trackers[i].TotalSeconds = frame->TotalSeconds;
+      trackers[i].OnSeconds = frame->OnSeconds;
+      trackers[i].IsOn = frame->IsOn;
+      trackers[i].LastResets = frame->NumberOfResets;
+      trackers[i].LastRSSI = rssi;
       trackers[i].LastSeen = now;
-//        Serial.println("Cons OK: ID=0x" + String(id, HEX) + ", Cons=" + String(consumption, 3));
+      pushHistory(&trackers[i], frame->Power);
       return true;
     }
   }
 
   for (int i = 0; i < MAX_IDS; i++) {
     if (!trackers[i].Initialized) {
-      trackers[i].ID = id;
-      trackers[i].LastResets = 0;
-      trackers[i].LastConsumption = consumption;
+      trackers[i].ID = frame->ID;
+      trackers[i].LastResets = frame->NumberOfResets;
+      trackers[i].LastConsumption = frame->Consumption;
+      trackers[i].LastPower = frame->Power;
+      trackers[i].MaxPower = frame->MaximumPower;
+      trackers[i].TotalSeconds = frame->TotalSeconds;
+      trackers[i].OnSeconds = frame->OnSeconds;
+      trackers[i].IsOn = frame->IsOn;
+      trackers[i].LastRSSI = rssi;
       trackers[i].Initialized = true;
       trackers[i].LastSeen = now;
-      *lastConsumption = consumption;
-//        Serial.println("Cons Fallback Init: ID=0x" + String(id, HEX) + ", Cons=" + String(consumption, 3));
+      trackers[i].HistoryCount = 0;
+      trackers[i].HistoryHead = 0;
+      pushHistory(&trackers[i], frame->Power);
+      *lastConsumption = frame->Consumption;
       return true;
     }
   }
-
   return false;
 }
 
-void updateDisplayPage(uint16_t id, float power, double consumption) {
+// --- WebServer Endpunkte (speichersicher per Chunked Transfer) ---
+void handleRoot() {
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleApiData() {
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+
+  char buf[416];
+  snprintf(buf, sizeof(buf),
+           "{\"uptime\":%lu,\"wifiRssi\":%d,\"mqtt\":%s,\"freeHeap\":%u,\"minHeap\":%u,\"resetReason\":%d,\"devices\":[",
+           millis() / 1000, WiFi.RSSI(), client.connected() ? "true" : "false",
+           ESP.getFreeHeap(), ESP.getMinFreeHeap(), (int)esp_reset_reason());
+  server.sendContent(buf);
+
   unsigned long now = millis();
+  bool firstDev = true;
 
-  // Find existing page or create new
   for (int i = 0; i < MAX_IDS; i++) {
-    if (displayPages[i].active && displayPages[i].ID == id) {
-      displayPages[i].Power = power;
-      displayPages[i].Consumption = consumption;
-      displayPages[i].lastUpdate = now;
-      return;
+    if (!trackers[i].Initialized) continue;
+
+    if (!firstDev) server.sendContent(",");
+    firstDev = false;
+
+    unsigned long ageSec = (now - trackers[i].LastSeen) / 1000;
+    const char* devName = getDeviceName(trackers[i].ID);
+
+    snprintf(buf, sizeof(buf),
+             "{\"id\":\"%04X\",\"name\":\"%s\",\"power\":%.1f,\"maxPower\":%.1f,\"consumption\":%.3f,"
+             "\"onSeconds\":%lu,\"isOn\":%s,\"rssi\":%.1f,\"ageSec\":%lu,\"history\":[",
+             trackers[i].ID, devName ? devName : "Unbekannt",
+             trackers[i].LastPower, trackers[i].MaxPower, trackers[i].LastConsumption,
+             trackers[i].OnSeconds, trackers[i].IsOn ? "true" : "false", trackers[i].LastRSSI, ageSec);
+    server.sendContent(buf);
+
+    uint8_t count = trackers[i].HistoryCount;
+    uint8_t start = (count < HISTORY_LEN) ? 0 : trackers[i].HistoryHead;
+    char numBuf[12];
+    for (uint8_t h = 0; h < count; h++) {
+      uint8_t idx = (start + h) % HISTORY_LEN;
+      float val = trackers[i].History[idx] / 10.0f;
+      snprintf(numBuf, sizeof(numBuf), "%s%.1f", (h > 0) ? "," : "", val);
+      server.sendContent(numBuf);
     }
+    server.sendContent("]}");
   }
 
-  // Create new page if space available
-  for (int i = 0; i < MAX_IDS; i++) {
-    if (!displayPages[i].active) {
-      displayPages[i].ID = id;
-      displayPages[i].Power = power;
-      displayPages[i].Consumption = consumption;
-      displayPages[i].lastUpdate = now;
-      displayPages[i].active = true;
-      totalPages++;
-      return;
-    }
-  }
-}
-
-void drawDisplay() {
-  u8g2.clearBuffer();
-  if (showFontPopup && millis() - fontPopupStart < FONT_POPUP_DURATION) {
-    // Popup: show font index only
-    u8g2.setFont(u8g2_font_fub30_tn);  // Large numeric font (~30px)
-    char popup[3];
-    snprintf(popup, sizeof(popup), "%d", currentFontIndex);
-    int width = u8g2.getStrWidth(popup);
-    int height = u8g2.getFontAscent() - u8g2.getFontDescent();
-    int x = xOffset + (ScreenWidth - width) / 2;    // Center horizontally
-    int y = yOffset + (ScreenHeight - height) / 2;  // Center vertically
-    u8g2.setCursor(x, y);
-    u8g2.print(popup);
-    Serial.println("Drawing popup: " + String(popup));
-  } else {
-    // Normal display
-    showFontPopup = false;  // Hide popup after 3s
-    u8g2.setFont(fonts[currentFontIndex]);
-    if (totalPages == 0) {
-      u8g2.setCursor(xOffset, yOffset);
-      u8g2.print("...");  // Show that we are still Waiting for the very first packets ... only seen at system startup until the first packet comes in
-    } else {
-      // Find the actual page index
-      int displayIndex = 0;
-      for (int i = 0, count = 0; i < MAX_IDS; i++) {
-        if (displayPages[i].active) {
-          if (count == currentPage) {
-            displayIndex = i;
-            break;
-          }
-          count++;
-        }
-      }
-      // Calculate loading bar progress (5 seconds total)
-      unsigned long elapsed = millis() - displayPages[displayIndex].lastUpdate;
-      int barWidth = (elapsed * ScreenWidth) / 5000;
-      if (barWidth > ScreenWidth) {
-        barWidth = ScreenWidth;
-      }
-
-      // Draw content with current font
-      u8g2.setFont(fonts[currentFontIndex]);
-      char buffer[20];
-
-      // ID
-      snprintf(buffer, sizeof(buffer), "%04X ID", displayPages[displayIndex].ID);
-      u8g2.setCursor(xOffset, yOffset);
-      u8g2.print(buffer);
-
-      // Loading bar
-      u8g2.drawHLine(xOffset, yOffset + 13, barWidth);
-
-      // Power
-      snprintf(buffer, sizeof(buffer), "%.1f W", displayPages[displayIndex].Power);
-      u8g2.setCursor(xOffset, yOffset + 14);
-      u8g2.print(buffer);
-
-      // Consumption
-      snprintf(buffer, sizeof(buffer), "%.3f KWH", displayPages[displayIndex].Consumption);
-      u8g2.setCursor(xOffset, yOffset + 28);
-      u8g2.print(buffer);
-    }
-  }
-  u8g2.sendBuffer();
-}
-
-void handleButton() {
-  int reading = digitalRead(buttonPin);
-  // Serial.print("Button reading: ");
-  // Serial.println(reading); // Show the button state (must be "1" !!!)
-
-  if (reading == LOW && lastButtonState == HIGH) {
-    // Button just pressed
-    buttonPressStart = millis();
-    buttonIsPressed = true;
-    Serial.println("Button pressed - starting timer");
-  } else if (reading == HIGH && lastButtonState == LOW) {
-    // Button released
-    unsigned long pressDuration = millis() - buttonPressStart;
-    buttonIsPressed = false;
-    if (pressDuration < LONG_PRESS_DURATION) {
-      // Short press: cycle page
-      if (totalPages > 0) {
-        currentPage = (currentPage + 1) % totalPages;
-        Serial.println("Short press - Cycling to page: " + String(currentPage));
-        drawDisplay();
-      } else {
-        Serial.println("Short press - No pages to cycle");
-      }
-    }
-    Serial.println("Button released - duration: " + String(pressDuration) + "ms");
-  } else if (buttonIsPressed && reading == LOW) {
-    // Button held
-    unsigned long pressDuration = millis() - buttonPressStart;
-    if (pressDuration >= LONG_PRESS_DURATION) {
-      // Long press: cycle font
-      currentFontIndex = (currentFontIndex + 1) % numFonts;
-      fontPopupStart = millis();
-      showFontPopup = true;
-      Serial.println("Long press - Cycling to font index: " + String(currentFontIndex));
-      drawDisplay();
-      buttonIsPressed = false;  // Prevent repeat triggers
-    }
-  }
-  lastButtonState = reading;
-}
-
-void cleanStaleIDs() {
-  unsigned long now = millis();
-  for (int i = 0; i < MAX_IDS; i++) {
-    if (resetTrackers[i].Initialized && (now - resetTrackers[i].LastSeen > 66000)) {
-      Serial.print("Removing stale ID: 0x"); Serial.println(resetTrackers[i].ID, HEX);
-      client.publish("EC3000/debug", "Removing stale ID");
-      resetTrackers[i].Initialized = false;
-      discoverySent[i] = false; // Allow rediscovery if ID reappears
-    }
-  }
+  server.sendContent("]}");
+  server.sendContent("");
 }
 
 void printFrame(struct Frame* frame, float rssi) {
-  Serial.print("RSSI: "); Serial.print(rssi); Serial.println(" dBm");
-  Serial.print("ID: 0x"); Serial.println(frame->ID, HEX);
-  Serial.print("Total Seconds: "); Serial.print(frame->TotalSeconds);
-  printTimeBreakdown(frame->TotalSeconds);
-  Serial.println();
-  Serial.print("On Seconds: "); Serial.print(frame->OnSeconds);
-  printTimeBreakdown(frame->OnSeconds);
-  Serial.println();
-  Serial.print("Consumption: "); Serial.print(frame->Consumption); Serial.println(" kWh");
-  Serial.print("Power: "); Serial.print(frame->Power); Serial.println(" W");
-  Serial.print("Max Power: "); Serial.print(frame->MaximumPower); Serial.println(" W");
-  Serial.print("Resets: "); Serial.println(frame->NumberOfResets);
-  Serial.print("Is On: "); Serial.println(frame->IsOn ? "Yes" : "No");
-  Serial.print("CRC: 0x"); Serial.println(frame->CRC, HEX);
+  const char* devName = getDeviceName(frame->ID);
+  Serial.printf("RSSI: %.2f dBm | %s (0x%04X) | Total: %lus | On: %lus | Cons: %.3f kWh | Power: %.1f W | Max: %.1f W | Resets: %u | On: %s | CRC: 0x%04X\n",
+                rssi, devName ? devName : "Unknown", frame->ID, frame->TotalSeconds, frame->OnSeconds, frame->Consumption,
+                frame->Power, frame->MaximumPower, frame->NumberOfResets,
+                frame->IsOn ? "Yes" : "No", frame->CRC);
 }
 
-void publishSystemStatus(uint16_t id) {
-  char topic[32];
-  snprintf(topic, sizeof(topic), "EC3000/system", id);
+void publishSystemStatus() {
+  if (!client.connected()) return;
 
-  // Systemdaten sammeln
-  unsigned long uptime = millis() / 1000; // Sekunden
-  int32_t rssi = WiFi.RSSI();             // dBm
-  uint32_t freeHeap = ESP.getFreeHeap();  // Bytes
+  char payload[256];
+  IPAddress ip = WiFi.localIP();
+  snprintf(payload, sizeof(payload),
+           "{\"Uptime\":%lu,\"WiFiRSSI\":%d,\"IP\":\"%u.%u.%u.%u\",\"FreeHeap\":%u,\"MinFreeHeap\":%u,\"Reconnects\":%u,\"ResetReason\":%d}",
+           millis() / 1000, WiFi.RSSI(), ip[0], ip[1], ip[2], ip[3],
+           ESP.getFreeHeap(), ESP.getMinFreeHeap(), reconcount, (int)esp_reset_reason());
 
-  // JSON-Nachricht bauen
-  String payload = "{";
-  payload += "\"Uptime\":" + String(uptime) + ",";
-  payload += "\"WiFiRSSI\":" + String(rssi) + ",";
-  payload += "\"IP\":" + String(WiFi.localIP().toString().c_str()) + ",";
-  payload += "\"FreeHeap\":" + String(freeHeap) + ",";
-  payload += "\"Reconnects\":" + String(reconcount);
-  payload += "}";
   Serial.println(payload);
-  client.publish(topic, payload.c_str());
+  client.publish("EC3000/system", payload);
 }
 
 void setup() {
   Serial.begin(115200);
-  // while (!Serial) delay(10);
-  delay(2000);
+  delay(1000);
 
-    // Initialize display
-    u8g2.begin();
-    // u8g2.setFont(u8g2_font_8bitclassic_tr); // Set a readable font
-    u8g2.setFont(u8g2_font_missingplanet_tr);
-    // u8g2.setFont(u8g2_font_questgiver_tr);
-    // u8g2.setFont(u8g2_font_crox1tb_tr);
-    // u8g2.setFont(u8g2_font_lastapprenticethin_tr);
-    // u8g2.setFont(u8g2_font_eckpixel_tr);
-    // u8g2.setFont(u8g2_font_tenthinnerguys_tr);
-    // u8g2.setFont(u8g2_font_NokiaSmallBold_tr);
-    // u8g2.setFontRefHeightExtendedText();
-    u8g2.setDrawColor(1);
-    u8g2.setBusClock(25000000);
-    u8g2.setFontPosTop();
-    u8g2.setContrast(255);
-    // u8g2.setFontDirection(0);
-    u8g2.clearBuffer();
-    u8g2.setCursor(xOffset, yOffset);
-    u8g2.print("EC3000 MQTT Bridge");
-    u8g2.sendBuffer();
-  
-    // Configure LED PWM with new ESP-IDE > v3 API (in short: it's now ledcAttach instead of ledcAttachSetup and ledcAttachPin)
-    Serial.println(LED_PIN);
-    delay(5000);
-    u8g2.print(LED_PIN);
-    u8g2.sendBuffer();
-    // pinMode(LED_PIN, OUTPUT);
-    ledcAttach(LED_PIN, LED_PWM_FREQ, LED_PWM_RESOLUTION);  // Auto-assigns channel
-    ledcWrite(LED_PIN, 255);                                // Off for active-low
+  setStatusLed(0, 0, LED_BRIGHTNESS); // Blau: Systemstart
 
+  // Hardware-Watchdog aktivieren (ESP-IDF v5 / Arduino Core 3.x API)
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WDT_TIMEOUT * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  esp_task_wdt_reconfigure(&wdt_config);
+  esp_task_wdt_add(NULL);
+
+  // WLAN starten
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
+
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) {
     delay(500);
+    esp_task_wdt_reset();
     Serial.print(".");
   }
-  Serial.println("\nWiFi connected");
-  Serial.println(WiFi.localIP());
-  u8g2.setCursor(xOffset, yOffset + 14);
-  u8g2.print("WLAN verbunden!");
-  u8g2.sendBuffer();
 
-  client.setBufferSize(1024);  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected");
+    Serial.println(WiFi.localIP());
+  }
+
+  // WebServer starten
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/data", HTTP_GET, handleApiData);
+  server.begin();
+  Serial.println("Web dashboard started on port 80");
+
+  client.setBufferSize(1024);
   client.setServer(mqtt_server, mqtt_port);
-  if (!client.connected()) {
-    if (client.connect("ESP32C3Client",mqtt_user,mqtt_password)) {
-      Serial.println("Verbunden mit dem MQTT-Server!");
-    } else {
-      Serial.print("Verbindung fehlgeschlagen, rc=");
-      Serial.println(client.state());
-      delay(5000);
-    }
-  }
-  if (!client.publish("EC3000/debug", "EC3000 MQTT Bridge initialized successfully!")) {
-    Serial.println("Fehler beim Senden der DEBUG-Nachricht.");
-  }
 
+  // RFM69 Reset & SPI Start
   pinMode(RFM69_CS, OUTPUT);
   digitalWrite(RFM69_CS, HIGH);
 
@@ -816,44 +708,34 @@ void setup() {
   WriteReg(REG_PAYLOADLENGTH, 0x0A);
   if (ReadReg(REG_PAYLOADLENGTH) != 0x0A) {
     Serial.println("RFM69 detection failed at step 1!");
-    u8g2.setCursor(xOffset, yOffset + 14);
-    u8g2.print("No RFM69");
-    u8g2.setCursor(xOffset, yOffset + 28);
-    u8g2.print("found!!");
-    u8g2.sendBuffer();
-    while (1);
+    setStatusLed(LED_BRIGHTNESS, 0, LED_BRIGHTNESS);
+    while (1) { delay(1000); }
   }
   WriteReg(REG_PAYLOADLENGTH, 0x40);
   if (ReadReg(REG_PAYLOADLENGTH) != 0x40) {
     Serial.println("RFM69 detection failed at step 2!");
-    u8g2.setCursor(xOffset, yOffset + 14);
-    u8g2.print("No RFM69");
-    u8g2.setCursor(xOffset, yOffset + 28);
-    u8g2.print("found!!");
-    u8g2.sendBuffer();
-    while (1);
+    setStatusLed(LED_BRIGHTNESS, 0, LED_BRIGHTNESS);
+    while (1) { delay(1000); }
   }
   Serial.println("RFM69 detected!");
 
-  // Set RFM69 Frequency to 868.3 MhZ
   unsigned long f = (((FREQUENCY_KHZ * 1000UL) << 2) / (32000000UL >> 11)) << 6;
   WriteReg(0x07, f >> 16);
   WriteReg(0x08, f >> 8);
   WriteReg(0x09, f);
 
-  // Set RFM69 Datarate to 20000 baud (20kbps)
   uint16_t r = ((32000000UL + (DATA_RATE / 2)) / DATA_RATE);
   WriteReg(0x03, r >> 8);
   WriteReg(0x04, r & 0xFF);
-  
-  // Set EC3000 Preamble Bytes and Modulation and so on...
+
   WriteReg(0x02, 0x00);
   WriteReg(0x05, 0x01);
   WriteReg(0x06, 0x48);
   WriteReg(0x11, 0x9F);
   WriteReg(0x13, 0x0F);
   WriteReg(0x18, 0x80);
-  WriteReg(0x19, 0x42);
+  WriteReg(0x19, 0x51); // RxBw ~125 kHz
+  WriteReg(0x1E, 0x0C); // AFC AutoOn + AutoClearOn
   WriteReg(0x28, 0x10);
   WriteReg(0x29, 220);
   WriteReg(0x2E, 0xA0);
@@ -862,188 +744,115 @@ void setup() {
   WriteReg(0x31, 0x85);
   WriteReg(0x32, 0xD3);
   WriteReg(0x33, 0xAC);
-  WriteReg(0x37, 0x08);
+  WriteReg(0x37, 0x00);
   WriteReg(0x38, 64);
   WriteReg(0x3C, 0x8F);
-  WriteReg(0x3D, 0x12);
+  WriteReg(0x3D, 0x10);
   WriteReg(0x6F, 0x30);
 
   WriteReg(REG_OPMODE, (ReadReg(REG_OPMODE) & 0xE3) | 0x10);
+  Serial.println("RFM69 initialized in RX mode!");
 
-  Serial.println("RFM69 initialized successfully!");
-  u8g2.setCursor(xOffset, yOffset + 28);
-  u8g2.print("Found RFM69");
-  u8g2.sendBuffer();
+  handleConnections();
+}
 
-  for (int i = 0; i < whitelistSize; i++) {
-    uint16_t id = strtol(whitelist[i], nullptr, 16);  // Umwandlung von Hex-String zu uint16_t
-    publishDiscoveryMessages(id);
-  }
-
-  uint8_t reg07 = ReadReg(0x07);
-  uint8_t reg08 = ReadReg(0x08);
-  uint8_t reg09 = ReadReg(0x09);
-  uint32_t freqVal = ((uint32_t)reg07 << 16) | (reg08 << 8) | reg09;
-  float freqMHz = (freqVal * 32000000.0) / (1UL << 19) / 1000000.0;
-
-  uint8_t reg03 = ReadReg(0x03);
-  uint8_t reg04 = ReadReg(0x04);
-  uint16_t bitrateVal = (reg03 << 8) | reg04;
-  float bitrate = 32000000.0 / bitrateVal / 1000.0;
-
-  webserver.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    String html = "<html><body><h2>ESP EC3000</h2>";
-    // html += "<p>Power: " + String(currentPower) + " W</p>";
-    html += "<p>RSSI: " + String(WiFi.RSSI()) + " dBm</p>";
-    html += "<p>Uptime: " + String(millis() / 1000) + " s</p>";
-    html += "</body></html>";
-    request->send(200, "text/html", html);
-  });
-
-  webserver.begin();
-  Serial.print("Listening at ");
-  Serial.print(freqMHz);
-  Serial.print(" MHz with ");
-  Serial.print(bitrate);
-  Serial.println(" kbps...");
-
-  }
-  
 void loop() {
-  if (!client.connected()) {
-    reconnect();
+  esp_task_wdt_reset();
+  updateStatusLed();
+  handleConnections();
+  server.handleClient();
+
+  if (client.connected()) {
+    client.loop();
   }
 
   if (millis() - lastStatusPublish > 30000) {
-    publishSystemStatus(0xDEAD); // Beispiel-ID
+    publishSystemStatus();
     lastStatusPublish = millis();
   }
 
-  client.loop();
+  uint8_t irqFlags2 = ReadReg(REG_IRQFLAGS2);
 
-  cleanStaleIDs();
-
-  handleButton();
-
-  if (ReadReg(REG_IRQFLAGS2) & 0x04) {
-    m_payloadPointer = 0;
-    for (int i = 0; i < 64; i++) {
-      uint8_t bt = GetByteFromFifo();
-      m_payload[i] = bt;
-      m_payloadPointer++;
-    }
-    m_payloadReady = true;
-
-    uint8_t ec3k_payload[PAYLOAD_SIZE];
-    for (int i = 0; i < PAYLOAD_SIZE; i++) {
-      ec3k_payload[i] = m_payload[i];
+  if (irqFlags2 & 0x04) {
+    uint8_t idx = 0;
+    while ((ReadReg(REG_IRQFLAGS2) & 0x40) && idx < 64) {
+      m_payload[idx++] = GetByteFromFifo();
     }
 
-    struct Frame frame;
-    DecodeFrame(ec3k_payload, &frame);
-
-    float rssi = -(ReadReg(0x27) / 2.0);
-
-    bool valid = true;
-    String reason = "";
-    
-    String idStr = String(frame.ID, HEX);  // wandelt z. B. 0xBF8C → "bf8c"
-    idStr.toUpperCase();                   // jetzt: "BF8C"
-
-    if (!isWhitelisted(idStr)) {
-      valid = false;
-      reason += "wrong ID" + idStr;
-      return;
+    if (ReadReg(REG_IRQFLAGS2) & 0x50) {
+      WriteReg(REG_IRQFLAGS2, 0x10);
+      WriteReg(0x3D, 0x12);
     }
 
-    if(frame.IsValid == false) {
-      valid = false;
-      reason += "CRC invalid; ";
-    }
+    if (idx >= PAYLOAD_SIZE) {
+      uint8_t ec3k_payload[PAYLOAD_SIZE];
+      memcpy(ec3k_payload, m_payload, PAYLOAD_SIZE);
 
-    if (frame.OnSeconds > frame.TotalSeconds) {
-      valid = false;
-      reason += "OnSeconds > TotalSeconds; ";
-    }
+      struct Frame frame = {0};
+      DecodeFrame(ec3k_payload, &frame);
 
-    if (!frame.IsOn && frame.Power != 0) {
-      valid = false;
-      reason += "IsOn=No but Power>0; ";
-    }
+      float rssi = -(ReadReg(0x27) / 2.0f);
 
-    if (frame.Power > 3500) {
-      valid = false;
-      reason += "Power too high; ";
-    }
+      if (!isWhitelisted(frame.ID)) {
+        return;
+      }
 
-    double lastConsumption;
-    if (!checkConsumption(frame.ID, frame.Consumption, &lastConsumption)) {
-      valid = false;
-      reason += "Consumption invalid (last=" + String(lastConsumption, 3) + "); ";
-    }
+      bool valid = true;
+      char reason[128] = "";
+      int rPos = 0;
 
-    if (logOnlyFailed) {
+      if (!frame.IsValid) {
+        valid = false;
+        rPos += snprintf(reason + rPos, sizeof(reason) - rPos, "CRC invalid; ");
+      }
+      if (frame.OnSeconds > frame.TotalSeconds) {
+        valid = false;
+        rPos += snprintf(reason + rPos, sizeof(reason) - rPos, "OnSeconds > TotalSeconds; ");
+      }
+      if (!frame.IsOn && frame.Power != 0) {
+        valid = false;
+        rPos += snprintf(reason + rPos, sizeof(reason) - rPos, "IsOn=No but Power>0; ");
+      }
+      if (frame.Power > 3500) {
+        valid = false;
+        rPos += snprintf(reason + rPos, sizeof(reason) - rPos, "Power too high; ");
+      }
+
+      double lastConsumption = 0.0;
+      if (valid && !updateAndCheckTracker(&frame, rssi, &lastConsumption)) {
+        valid = false;
+        rPos += snprintf(reason + rPos, sizeof(reason) - rPos, "Consumption invalid (last=%.3f); ", lastConsumption);
+      }
+
       if (!valid) {
+        flashStatusLed(LED_BRIGHTNESS, LED_BRIGHTNESS / 2, 0);
         printFrame(&frame, rssi);
         Serial.print("Discarded: ");
-        client.publish("EC3000/debug", "Discarded");
         Serial.println(reason);
-        char debtopic[32];
-        char debpayload[256];
-        snprintf(debtopic, sizeof(debtopic), "EC3000/debug");
-        snprintf(debpayload, sizeof(debpayload), reason.c_str());
-        client.publish(debtopic, debpayload);
-        Serial.println();
+        if (client.connected()) {
+          client.publish("EC3000/debug", reason);
+        }
+        return;
       }
-    } else {
-      printFrame(&frame, rssi);
-      if (!valid) {
-        Serial.print("Discarded: ");
-        Serial.println(reason);
+
+      flashStatusLed(0, LED_BRIGHTNESS, 0);
+
+      if (!logOnlyFailed) {
+        printFrame(&frame, rssi);
       }
-      Serial.println();
+
+      if (client.connected()) {
+        char topic[32];
+        char payload[256];
+        snprintf(topic, sizeof(topic), "EC3000/%04X", frame.ID);
+        snprintf(payload, sizeof(payload),
+                 "{\"TotalSeconds\":%lu,\"OnSeconds\":%lu,\"Consumption\":%.3f,\"Power\":%.1f,\"MaximumPower\":%.1f,\"NumberOfResets\":%u,\"IsOn\":%d,\"CRC\":\"0x%04X\",\"RSSI\":%.2f}",
+                 frame.TotalSeconds, frame.OnSeconds, frame.Consumption, frame.Power, frame.MaximumPower, frame.NumberOfResets, frame.IsOn ? 1 : 0, frame.CRC, rssi);
+        client.publish(topic, payload);
+      }
     }
-
-    if (valid) {
-      char topic[32];
-      char payload[256];
-      snprintf(topic, sizeof(topic), "EC3000/%04X", frame.ID);
-      snprintf(payload, sizeof(payload),
-               "{\"TotalSeconds\":%lu,\"OnSeconds\":%lu,\"Consumption\":%.3f,\"Power\":%.1f,\"MaximumPower\":%.1f,\"NumberOfResets\":%u,\"IsOn\":%d,\"CRC\":\"0x%04X\",\"RSSI\":%.2f}",
-               frame.TotalSeconds, frame.OnSeconds, frame.Consumption, frame.Power, frame.MaximumPower, frame.NumberOfResets, frame.IsOn, frame.CRC, rssi);
-      client.publish(topic, payload);
-    }
-  } else {
-    // Full brightness for invalid packet
-    /* ledcWrite(LED_PIN, LED_INVALID_BRIGHTNESS);  // Full brightness
-    ledInvalidOnTime = millis();
-    ledInvalidIsOn = true;
-    ledValidIsOn = false;  // Cancel any valid flash
-    */
-    // Serial.println("Invalid packet received - LED ON (full)");
+  } else if (irqFlags2 & 0x10) {
+    WriteReg(REG_IRQFLAGS2, 0x10);
+    WriteReg(0x3D, 0x12);
   }
-  WriteReg(REG_IRQFLAGS2, 0x04);
-  m_payloadReady = false;
-
-  /* Turn LED off after respective durations
-  if (ledValidIsOn && millis() - ledValidOnTime >= LED_VALID_DURATION) {
-    ledcWrite(LED_PIN, 255);  // Off for active-low
-    ledValidIsOn = false;
-    // Serial.println("LED OFF (valid)");
-  }
-  if (ledInvalidIsOn && millis() - ledInvalidOnTime >= LED_INVALID_DURATION) {
-    ledcWrite(LED_PIN, 255);  // Off for active-low
-    ledInvalidIsOn = false;
-    // Serial.println("LED OFF (invalid)");
-  }
-  */
-
-  // Periodically refresh display to maintain loading bar animation
-  /* static unsigned long lastDisplayUpdate = 0;
-  if (millis() - lastDisplayUpdate > 100) {
-    drawDisplay();
-    lastDisplayUpdate = millis();
-  }
-  */
-
 }
