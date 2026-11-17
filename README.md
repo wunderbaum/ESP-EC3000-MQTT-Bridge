@@ -5,6 +5,8 @@ Ergänzt:
 - Webfrontend
 - Whitelist nun mit Gerätenamen
 
+<img width="841" height="285" alt="image" src="https://github.com/user-attachments/assets/3e420727-ba83-4016-8a1f-45000a191d54" />
+
 Wunderbaums changes:
 - made a platformio version out of it.
 - wifi-credentials are now in an external file include/wifidata.h
@@ -14,6 +16,8 @@ Wunderbaums changes:
 - Es gibt nun auch eine Unterstützung für die ESP32-C3-supermini mit OLED, danke an yustanotheruser!
 
 - platformio.ini unterscheidet jetzt 2 verschiedene ESP-boards. Das S2-Mini und das C3-super-mini mit dem 0.42" Display.
+
+
 
 
 # ESP-EC3000-MQTT-Bridge
